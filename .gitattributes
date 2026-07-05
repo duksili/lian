@@ -1,0 +1,31 @@
+# Normalize source text across Linux, macOS, and Windows.
+* text=auto eol=lf
+
+# Windows-native scripts retain CRLF where required.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Common text assets.
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.svg text eol=lf
+
+# Binary assets and user-data formats.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.gif binary
+*.pdf binary
+*.zip binary
+*.sqlite binary
+*.sqlite3 binary
+*.db binary
+*.parquet binary

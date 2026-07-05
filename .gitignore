@@ -1,0 +1,74 @@
+# LIAN — local user data, backups, and exports
+# Keep deliberately sanitized fixtures under fixtures/ or testdata/ trackable.
+/.lian/
+/data/local/
+/backups/
+/exports/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Node / Svelte / Vite
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.svelte-kit/
+.vite/
+dist/
+build/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Rust / Cargo / Tauri build output
+/target/
+/src-tauri/target/
+**/*.rs.bk
+
+# Test and coverage artifacts
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+blob-report/
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Environment files and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Local package-manager and tool caches
+.turbo/
+.eslintcache
+.stylelintcache
