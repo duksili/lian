@@ -6,12 +6,17 @@
 
   let { existing = null, onclose }: { existing?: any | null; onclose: () => void } = $props();
 
-  let kind = $state(existing?.kind ?? "illness");
-  let label = $state(existing?.label ?? "");
-  let startDate = $state(existing?.start_date ?? todayStr());
-  let endDate = $state(existing?.end_date ?? "");
-  let note = $state(existing?.note ?? "");
-  let ongoing = $state(existing ? !existing.end_date : true);
+  // This modal is mounted fresh per open, so fields deliberately capture the
+  // initial prop value; later prop mutation is not a supported flow here.
+  // svelte-ignore state_referenced_locally
+  const init = existing;
+
+  let kind = $state(init?.kind ?? "illness");
+  let label = $state(init?.label ?? "");
+  let startDate = $state(init?.start_date ?? todayStr());
+  let endDate = $state(init?.end_date ?? "");
+  let note = $state(init?.note ?? "");
+  let ongoing = $state(init ? !init.end_date : true);
   let saving = $state(false);
 
   async function save() {

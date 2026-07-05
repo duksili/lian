@@ -97,15 +97,28 @@
   }
 
   // ---------- protocol editor ----------
+  let pId = $state<string | null>(null);
   let pTitle = $state(""); let pQuestion = $state(""); let pHypothesis = $state("");
   let pIntervention = $state(""); let pAnalysisPlan = $state("");
   let pStart = $state(todayStr()); let pEnd = $state(addDays(todayStr(), 42));
   let pAdherence = $state(""); let pContextVars = $state(""); let pStop = $state("");
   let pOutcomeSummary = $state("");
+  let pSpec = $state<any | null>(null);
 
-  function openProtocolFrom(r: any | null) {
+  /** Prefill from a candidate-hypothesis result (r), an existing protocol (proto), or blank. */
+  function openProtocolFrom(r: any | null, proto: any | null = null) {
     protocolEditor = true;
-    if (r) {
+    pId = null; pSpec = null;
+    if (proto) {
+      pId = proto.id;
+      pTitle = proto.title; pQuestion = proto.question; pHypothesis = proto.hypothesis;
+      pIntervention = proto.intervention_definition; pAnalysisPlan = proto.analysis_plan;
+      pStart = proto.start_date ?? todayStr(); pEnd = proto.end_date ?? addDays(todayStr(), 42);
+      pAdherence = proto.adherence_requirements ?? ""; pContextVars = proto.context_variables ?? "";
+      pStop = proto.stop_criteria ?? "";
+      pOutcomeSummary = JSON.stringify(proto.primary_outcome_definition);
+      pSpec = proto.analysis_spec ?? null;
+    } else if (r) {
       const e = r.exposure_definition; const o = r.outcome_definition;
       pTitle = `${e.label ?? "exposure"} → ${o.label ?? "outcome"}`;
       pQuestion = `Does ${e.label ?? "the exposure"} relate to ${o.label ?? "the outcome"} ${r.time_window.lag_days === 0 ? "the same day" : `${r.time_window.lag_days} day(s) later`}?`;
@@ -113,6 +126,15 @@
       pAnalysisPlan = `Compare ${o.label} across ${e.label} levels with lag ${r.time_window.lag_days}, excluding invalid and familiarization sessions; median-split comparison and rank correlation as in analysis ${r.analysis_version}.`;
       pIntervention = "";
       pOutcomeSummary = JSON.stringify(o);
+      // Machine-readable pre-registration: exactly what analysis.run accepts.
+      const scope = r.source_data_scope ?? {};
+      pSpec = {
+        exposure: e, outcome: o, lag_days: r.time_window.lag_days,
+        from: r.time_window.from, to: r.time_window.to,
+        exclude_invalid: scope.exclude_invalid ?? true,
+        exclude_familiarization: scope.exclude_familiarization ?? true,
+        exclude_context_kinds: scope.exclude_context_kinds ?? [],
+      };
     } else {
       pTitle = ""; pQuestion = ""; pHypothesis = ""; pIntervention = ""; pAnalysisPlan = "";
       pOutcomeSummary = "";
@@ -121,7 +143,8 @@
 
   async function saveProtocol() {
     try {
-      await api("protocols.save", {
+      const saved = await api("protocols.save", {
+        id: pId,
         title: pTitle, question: pQuestion, hypothesis: pHypothesis,
         primary_outcome_definition: pOutcomeSummary ? JSON.parse(pOutcomeSummary) : { description: pQuestion, version: "analysis-1.0" },
         intervention_definition: pIntervention,
@@ -130,20 +153,53 @@
         adherence_requirements: pAdherence || null,
         context_variables: pContextVars || null,
         stop_criteria: pStop || null,
+        analysis_spec: pSpec,
       });
       protocolEditor = false;
-      toast("Protocol saved as draft", "ok");
+      if (pId && saved.id !== pId) {
+        toast(`Amendment created protocol version ${saved.version}`, "ok");
+      } else {
+        toast(pId ? "Protocol updated" : "Protocol saved as draft", "ok");
+      }
+      protoDetail = null;
       loadLists();
     } catch (e) { reportError(e); }
   }
 
   async function openProtocol(p: any) {
-    protoDetail = p;
-    // Once an active protocol's detail (with results) is viewed, outcome and
-    // analysis-plan edits must fork a new version.
-    if (["active", "paused", "completed"].includes(p.status) && p.results_locked !== 1) {
-      try { await api("protocols.lock_results", { id: p.id }); } catch { /* non-fatal */ }
-    }
+    try {
+      const full = await api("protocols.get", { id: p.id });
+      protoDetail = full;
+      // Viewing linked results is the moment outcome/plan edits must start
+      // forking a new version. A protocol without results stays unlocked.
+      if ((full.results ?? []).length > 0 && full.results_locked !== 1
+          && ["active", "paused", "completed"].includes(full.status)) {
+        await api("protocols.lock_results", { id: full.id });
+        full.results_locked = 1;
+      }
+    } catch (e) { reportError(e); }
+  }
+
+  let runningProtoAnalysis = $state(false);
+
+  /** Run the protocol's pre-registered analysis and persist the linked result. */
+  async function runProtocolAnalysis(p: any) {
+    if (!p.analysis_spec) return;
+    runningProtoAnalysis = true;
+    try {
+      const spec = { ...p.analysis_spec };
+      spec.from = p.start_date ?? spec.from;
+      const end = p.end_date && p.end_date < todayStr() ? p.end_date : todayStr();
+      spec.to = end;
+      spec.protocol_id = p.id;
+      spec.persist = true;
+      await api("analysis.run", spec);
+      await api("protocols.lock_results", { id: p.id });
+      protoDetail = await api("protocols.get", { id: p.id });
+      toast("Linked result recorded", "ok");
+      loadLists();
+    } catch (e) { reportError(e); }
+    runningProtoAnalysis = false;
   }
 
   async function protocolAction(p: any, action: string, arg?: string) {
@@ -485,10 +541,42 @@
           <p class="dim">{EVIDENCE_LABELS[protoDetail.conclusion]?.label}{protoDetail.conclusion_note ? ` — ${protoDetail.conclusion_note}` : ""}</p>
         </div>
       {/if}
+
+      {#if (protoDetail.results ?? []).length > 0}
+        <section>
+          <div class="overline" style="margin-bottom:6px;">Linked results</div>
+          <div class="col" style="gap:4px;">
+            {#each protoDetail.results as r (r.id)}
+              <div class="inset" style="padding:8px 12px;">
+                <div class="row between wrap">
+                  <span class="small">{fmtInstant(r.generated_at)} · n={r.included_count} · excluded {r.excluded_count} · missing {r.missing_count}</span>
+                  <span class="pill" title={EVIDENCE_LABELS[r.evidence_label]?.hint}>{EVIDENCE_LABELS[r.evidence_label]?.label ?? r.evidence_label}</span>
+                </div>
+                <p class="small faint">
+                  {r.exposure_definition.label ?? r.exposure_definition.kind} → {r.outcome_definition.label ?? r.outcome_definition.kind}
+                  · lag {r.time_window.lag_days}d · window {r.time_window.from}…{r.time_window.to} · {r.analysis_version}
+                  {#if r.is_stale === 1}· <span style="color:var(--caution);">stale</span>{/if}
+                </p>
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
+
       <div class="row wrap">
         {#if protoDetail.status === "draft"}
           <button class="btn sm primary" onclick={() => protocolAction(protoDetail, "status", "active")}>Activate</button>
+          <button class="btn sm" onclick={() => openProtocolFrom(null, protoDetail)}>Edit draft</button>
         {:else if protoDetail.status === "active"}
+          {#if protoDetail.analysis_spec}
+            <button class="btn sm primary" onclick={() => runProtocolAnalysis(protoDetail)} disabled={runningProtoAnalysis}>
+              Run predefined analysis
+            </button>
+          {/if}
+          <button class="btn sm" onclick={() => openProtocolFrom(null, protoDetail)}
+            title={protoDetail.results_locked === 1 ? "Results have been viewed — outcome/plan changes will create a new version" : "Edit protocol"}>
+            {protoDetail.results_locked === 1 ? "Amend (new version)" : "Edit"}
+          </button>
           <button class="btn sm" onclick={() => protocolAction(protoDetail, "status", "paused")}>Pause</button>
           <button class="btn sm" onclick={() => protocolAction(protoDetail, "conclude", "protocol_result_supported")}>Conclude: supported</button>
           <button class="btn sm" onclick={() => protocolAction(protoDetail, "conclude", "protocol_result_not_supported")}>not supported</button>
@@ -498,7 +586,7 @@
           <button class="btn sm" onclick={() => protocolAction(protoDetail, "status", "cancelled")}>Cancel protocol</button>
         {/if}
       </div>
-      <p class="small faint">A supported result means “consistent with the predefined hypothesis for me, in this period” — nothing more.</p>
+      <p class="small faint">A supported result means “consistent with the predefined hypothesis for me, in this period” — nothing more. Null and negative results are kept.</p>
     </div>
   </Modal>
 {/if}

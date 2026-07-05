@@ -384,12 +384,19 @@ pub fn run_association(conn: &Connection, spec: AssociationSpec) -> Result<Value
     if excluded > 0 {
         caveats.push(format!("{excluded} observations excluded (invalid, familiarization, or context filters)."));
     }
+    if spec.protocol_id.is_some() {
+        caveats.push(
+            "Linked to a research protocol: the formal conclusion is set explicitly on the protocol, \
+             using only the protocol evidence labels."
+                .into(),
+        );
+    }
 
     let groups = group_comparison(&pairs);
     let generated_at = now_rfc3339();
     let result = json!({
         "id": new_id(),
-        "kind": "association",
+        "kind": if spec.protocol_id.is_some() { "protocol_result" } else { "association" },
         "generated_at": generated_at,
         "analysis_version": ANALYSIS_VERSION,
         "exposure_definition": {

@@ -32,6 +32,10 @@
       await loadGlobals();
       if (!app.settings.onboarding_complete) go({ name: "onboarding" });
       ready = true;
+      if (import.meta.env.DEV) {
+        const { maybeAutopilot } = await import("./lib/autopilot");
+        maybeAutopilot(app.settings);
+      }
     } catch (e) {
       reportError(e);
       ready = true;

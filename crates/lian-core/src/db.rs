@@ -3,9 +3,12 @@ use std::path::Path;
 
 use crate::Result;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("migrations/0001_init.sql")),
+    (2, include_str!("migrations/0002_protocol_analysis_spec.sql")),
+];
 
 /// Open (or create) the LIAN database at `path`, applying pending migrations.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -40,6 +43,15 @@ pub fn schema_version(conn: &Connection) -> Result<i64> {
 
 fn migrate(conn: &Connection) -> Result<()> {
     let current = schema_version(conn)?;
+    // Forward guard: refuse to open (and possibly corrupt) a database written
+    // by a newer LIAN than this binary understands.
+    if current > SCHEMA_VERSION {
+        return Err(crate::Error::invalid(format!(
+            "this database uses schema v{current}, but this version of LIAN supports up to v{}; \
+             update LIAN instead of opening the database",
+            SCHEMA_VERSION
+        )));
+    }
     for (version, sql) in MIGRATIONS {
         if *version > current {
             conn.execute_batch(sql)?;

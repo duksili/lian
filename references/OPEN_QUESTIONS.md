@@ -28,7 +28,13 @@ Use this file for true unresolved design choices, implementation conflicts, or d
 5. **Assessment window behavior**
    - Decision: a due assessment stays **available outside its window**; the deviation is recorded as validity reason `taken_outside_configured_window` (session marked `caution`, never blocked, never hidden).
 
-6. **Recurrence model** (added for transparency; not in the original list)
+6. **Assessment input method** (2026-07-05, R1 remediation LIAN-03)
+   - Decision: v1 fixes the response input to the **spacebar** as an explicit protocol contract; both runners record `keyboard_spacebar` as session provenance, and validity evaluation compares the session's recorded method against the configured `assessment_input_method` setting, producing `input_method_differs_from_configured` on mismatch. A configurable key mapping is a later, deliberate change.
+
+7. **PVT duration semantics** (2026-07-05, R1 remediation LIAN-01)
+   - Decision: the runner consumes the seeded interval pool against a monotonic 5-minute deadline and stops as soon as the next response window cannot fit, so a completed session ends at most ~14 s before the deadline and never after it. Validity: ended > 20 s early → `incomplete_duration` (invalid); overrun > 15 s → `duration_overrun` (caution); > 60 s → invalid. `pvt-1.0` was never released with the prior nominal-schedule behavior, so the version identifier is retained.
+
+8. **Recurrence model** (added for transparency; not in the original list)
    - Series definitions live in `plan_series`; occurrences are materialized into `plans` idempotently per `(series_id, occurrence_date)`. Editing or ending a series regenerates only future occurrences that are unlinked and untouched; everything else is immutable history.
 
 ## Decision record format

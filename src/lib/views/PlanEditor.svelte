@@ -18,17 +18,23 @@
     ["custom", "Custom"],
   ] as const;
 
-  let kind = $state(existing?.kind ?? "activity");
-  let title = $state(existing?.title ?? "");
-  let templateId = $state(existing?.activity_template_id ?? "");
-  let assessmentKind = $state(existing?.assessment_kind ?? "pvt_v1");
-  let date = $state(existing?.local_date ?? initialDate);
-  let hasTime = $state(existing ? !existing.date_only : true);
+  // Mounted fresh per open: fields deliberately capture the initial props.
+  // svelte-ignore state_referenced_locally
+  const init = existing;
+  // svelte-ignore state_referenced_locally
+  const initDate = initialDate;
+
+  let kind = $state(init?.kind ?? "activity");
+  let title = $state(init?.title ?? "");
+  let templateId = $state(init?.activity_template_id ?? "");
+  let assessmentKind = $state(init?.assessment_kind ?? "pvt_v1");
+  let date = $state(init?.local_date ?? initDate);
+  let hasTime = $state(init ? !init.date_only : true);
   let time = $state("07:30");
-  let durationMin = $state<string>(existing?.target_duration_seconds ? String(existing.target_duration_seconds / 60) : "");
-  let note = $state(existing?.note ?? "");
-  let reminderOffset = $state<string>(existing?.reminder_offset_minutes != null ? String(existing.reminder_offset_minutes) : "");
-  let determinationId = $state(existing?.determination_id ?? "");
+  let durationMin = $state<string>(init?.target_duration_seconds ? String(init.target_duration_seconds / 60) : "");
+  let note = $state(init?.note ?? "");
+  let reminderOffset = $state<string>(init?.reminder_offset_minutes != null ? String(init.reminder_offset_minutes) : "");
+  let determinationId = $state(init?.determination_id ?? "");
 
   // recurrence (only for new plans)
   let recurring = $state(false);

@@ -25,6 +25,7 @@ const JSON_COLUMNS: &[&str] = &[
     "source_data_scope",
     "values_json",
     "primary_outcome_definition",
+    "analysis_spec",
     "prior_values",
     "value",
 ];

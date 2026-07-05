@@ -1,29 +1,28 @@
 <script lang="ts">
   import { api } from "../api";
-  import { app, reportError, bump } from "../state.svelte";
+  import { reportError, bump } from "../state.svelte";
   import { onMount } from "svelte";
+  import { GngMachine, type GngAction } from "../assessment/gngMachine";
 
   let { onclose }: { onclose: (finished: boolean) => void } = $props();
 
-  type Phase = "prep" | "countdown" | "isi" | "stimulus" | "done" | "confirm_abort";
-  let phase = $state<Phase>("prep");
+  type UiPhase = "prep" | "countdown" | "isi" | "stimulus" | "blank" | "done" | "confirm_abort";
+  let phase = $state<UiPhase>("prep");
 
   const RESPONSE_WINDOW_MS = 1000; // fixed for protocol gng-1.0
   const STIMULUS_MS = 600;
 
   let familiarization = $state(false);
   let session = $state<any | null>(null);
-  let sequence: { stimulus: string; isi_ms: number }[] = [];
-  let trials: any[] = [];
+  let machine: GngMachine | null = null;
+  let totalTrials = $state(160);
   let trialIndex = $state(0);
   let currentStimulus = $state<"go" | "no_go">("go");
   let visibilityLost = 0;
-  let currentTrialVisibilityLost = false;
   let result = $state<any | null>(null);
   let feedbackText = $state("");
-  let sessionStart = 0;
-  let stimulusOnset = 0;
-  let responded = false;
+  let spaceDown = false;
+  let heldAtOnset = false;
 
   let timeouts: ReturnType<typeof setTimeout>[] = [];
   function later(fn: () => void, ms: number) {
@@ -35,9 +34,9 @@
   }
 
   function onVisibility() {
-    if (document.hidden && ["isi", "stimulus"].includes(phase)) {
+    if (document.hidden && machine) {
       visibilityLost++;
-      currentTrialVisibilityLost = true;
+      machine.markVisibilityLost();
     }
   }
 
@@ -53,7 +52,7 @@
     try {
       const started = await api("assessments.start", {
         kind: "go_no_go_v1",
-        input_method: app.settings.assessment_input_method ?? "keyboard_spacebar",
+        input_method: "keyboard_spacebar",
         device_metadata: {
           platform: navigator.platform,
           screen: `${screen.width}x${screen.height}`,
@@ -62,109 +61,131 @@
         is_familiarization: familiarization,
       });
       session = started.session;
-      sequence = started.sequence.trials;
-      trials = [];
-      trialIndex = 0;
+      const seq = started.sequence.trials as { stimulus: "go" | "no_go"; isi_ms: number }[];
+      totalTrials = seq.length;
+      machine = new GngMachine({
+        stimulusMs: STIMULUS_MS,
+        responseWindowMs: RESPONSE_WINDOW_MS,
+        trials: seq,
+      });
+      visibilityLost = 0;
       phase = "countdown";
       let count = 3;
       feedbackText = String(count);
       const tick = () => {
         count--;
-        if (count > 0) { feedbackText = String(count); later(tick, 1000); }
-        else { sessionStart = performance.now(); nextTrial(); }
+        if (count > 0) {
+          feedbackText = String(count);
+          later(tick, 1000);
+        } else {
+          exec(machine!.begin(performance.now()));
+        }
       };
       later(tick, 1000);
-    } catch (e) { reportError(e); onclose(false); }
-  }
-
-  function nextTrial() {
-    if (trialIndex >= sequence.length) { finish(false); return; }
-    currentTrialVisibilityLost = false;
-    responded = false;
-    phase = "isi";
-    const t = sequence[trialIndex];
-    later(() => {
-      currentStimulus = t.stimulus as "go" | "no_go";
-      stimulusOnset = performance.now();
-      phase = "stimulus";
-      // Stimulus disappears after STIMULUS_MS but the response window runs to
-      // RESPONSE_WINDOW_MS; then the trial is committed.
-      later(() => { if (phase === "stimulus" && !responded) phase = "isi"; }, STIMULUS_MS);
-      later(() => commitTrial(), RESPONSE_WINDOW_MS);
-    }, t.isi_ms);
-  }
-
-  function commitTrial() {
-    if (trialIndex >= sequence.length) return;
-    const t = sequence[trialIndex];
-    if (!responded) {
-      trials.push({
-        trial_index: trialIndex,
-        stimulus_kind: t.stimulus,
-        onset_ms: Math.round(stimulusOnset - sessionStart),
-        response_ms: null,
-        reaction_time_ms: null,
-        visibility_lost: currentTrialVisibilityLost,
-      });
-      trialIndex++;
-      nextTrial();
+    } catch (e) {
+      reportError(e);
+      onclose(false);
     }
   }
 
-  function respond() {
-    if (phase !== "stimulus" && phase !== "isi") return;
-    if (responded || trialIndex >= sequence.length) return;
-    // Only count as a response when a stimulus is in its window.
-    const sinceOnset = performance.now() - stimulusOnset;
-    if (phase === "isi" && (sinceOnset > RESPONSE_WINDOW_MS || stimulusOnset === 0)) return;
-    responded = true;
-    clearAll();
-    const t = sequence[trialIndex];
-    const rt = Math.round(sinceOnset);
-    trials.push({
-      trial_index: trialIndex,
-      stimulus_kind: t.stimulus,
-      onset_ms: Math.round(stimulusOnset - sessionStart),
-      response_ms: Math.round(performance.now() - sessionStart),
-      reaction_time_ms: t.stimulus === "go" ? rt : null,
-      visibility_lost: currentTrialVisibilityLost,
-    });
-    trialIndex++;
-    nextTrial();
+  /** Execute a machine action with real timers; the machine owns the protocol. */
+  function exec(action: GngAction) {
+    if (!machine) return;
+    trialIndex = machine.trialIndex;
+    switch (action.kind) {
+      case "isi":
+        phase = "isi";
+        later(() => {
+          heldAtOnset = spaceDown; // key already down when the stimulus appears
+          exec(machine!.stimulusDue(performance.now()));
+        }, action.ms);
+        break;
+      case "stimulus":
+        currentStimulus = action.stimulus;
+        phase = "stimulus";
+        // Stimulus hides after visibleMs; the response window runs to windowMs.
+        later(() => {
+          if (phase === "stimulus") phase = "blank";
+        }, action.visibleMs);
+        later(() => {
+          exec(machine!.windowClosed(performance.now()));
+        }, action.windowMs);
+        break;
+      case "finished":
+        finish(false);
+        break;
+    }
+  }
+
+  function respond(repeat: boolean) {
+    if (!machine) return;
+    const action = machine.response(performance.now(), { repeat });
+    if (action) {
+      clearAll();
+      exec(action);
+    }
   }
 
   async function finish(abortedEarly: boolean) {
+    if (!machine) return;
     phase = "done";
     clearAll();
     try {
       result = await api("assessments.finalize", {
         session_id: session.id,
-        trials,
-        context: { visibility_lost_count: visibilityLost, aborted: abortedEarly },
+        trials: machine.trials,
+        context: {
+          visibility_lost_count: visibilityLost,
+          key_hold_events: machine.keyHoldEvents,
+          input_method: "keyboard_spacebar",
+          aborted: abortedEarly,
+        },
       });
       bump();
-    } catch (e) { reportError(e); }
+    } catch (e) {
+      reportError(e);
+    }
   }
 
   async function abandonWithoutData() {
     try {
       await api("assessments.abort", { session_id: session.id, reason: "user cancelled before completion" });
       bump();
-    } catch (e) { reportError(e); }
+    } catch (e) {
+      reportError(e);
+    }
     onclose(false);
   }
 
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
-      if (["isi", "stimulus"].includes(phase)) { clearAll(); phase = "confirm_abort"; }
-      else if (phase === "prep") onclose(false);
+      if (["isi", "stimulus", "blank"].includes(phase)) {
+        clearAll();
+        phase = "confirm_abort";
+      } else if (phase === "prep") onclose(false);
       return;
     }
-    if (e.code === "Space") { e.preventDefault(); respond(); }
+    if (e.code === "Space") {
+      e.preventDefault();
+      // A held key produces repeats; a key held since before onset must be
+      // released before a press can count. Both are recorded as key-hold events.
+      if (e.repeat || heldAtOnset) {
+        machine?.response(performance.now(), { repeat: true });
+      } else {
+        respond(false);
+      }
+      spaceDown = true;
+    }
+  }
+  function onkeyup(e: KeyboardEvent) {
+    if (e.code === "Space") {
+      spaceDown = false;
+      heldAtOnset = false;
+    }
   }
 </script>
 
-<svelte:window on:keydown={onkeydown} />
+<svelte:window on:keydown={onkeydown} on:keyup={onkeyup} />
 
 <div class="stage">
   {#if phase === "prep"}
@@ -184,6 +205,7 @@
       <ul class="small dim rules">
         <li>Respond as quickly as you can to circles; hold back for squares.</li>
         <li>Each stimulus appears briefly. About four minutes total.</li>
+        <li>Press and release — a held key does not register.</li>
         <li>Occasional wrong presses are part of the task, not a failure.</li>
       </ul>
       <label class="row" style="gap:8px; cursor:pointer; margin: 14px 0;">
@@ -197,20 +219,20 @@
     </div>
   {:else if phase === "countdown"}
     <div class="big-counter mono faint">{feedbackText}</div>
-  {:else if phase === "isi"}
+  {:else if phase === "isi" || phase === "blank"}
     <div class="fix mono faint">+</div>
-    <div class="progress"><div class="bar" style:width="{(trialIndex / 160) * 100}%"></div></div>
+    <div class="progress"><div class="bar" style:width="{(trialIndex / totalTrials) * 100}%"></div></div>
   {:else if phase === "stimulus"}
     <div class="stim big" class:go={currentStimulus === "go"} class:nogo={currentStimulus === "no_go"}></div>
-    <div class="progress"><div class="bar" style:width="{(trialIndex / 160) * 100}%"></div></div>
+    <div class="progress"><div class="bar" style:width="{(trialIndex / totalTrials) * 100}%"></div></div>
   {:else if phase === "confirm_abort"}
     <div class="prep card pad">
       <h2 class="display">Stop the test?</h2>
       <p class="small dim" style="margin: 10px 0 16px;">
-        {trialIndex} of 160 trials done. Keep the partial data (marked incomplete) or discard the attempt.
+        {trialIndex} of {totalTrials} trials done. Keep the partial data (marked incomplete) or discard the attempt.
       </p>
       <div class="row" style="justify-content:flex-end;">
-        <button class="btn" onclick={() => nextTrial()}>Continue</button>
+        <button class="btn" onclick={() => exec(machine!.resume())}>Continue</button>
         <button class="btn" onclick={() => finish(true)}>Stop, keep data</button>
         <button class="btn danger" onclick={abandonWithoutData}>Discard attempt</button>
       </div>

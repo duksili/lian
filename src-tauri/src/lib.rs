@@ -40,30 +40,45 @@ fn data_location(db: tauri::State<'_, Db>) -> String {
 }
 
 /// Restore from a backup: verify + safety-copy via core, close the live
-/// connection, replace the database file, reopen and re-migrate.
+/// connection, then perform a staged, rollback-safe file swap. A failed swap
+/// or reopen rolls the previous database back automatically.
 #[tauri::command]
-fn restore_backup(db: tauri::State<'_, Db>, backup_path: String) -> Result<Value, String> {
+fn restore_backup(
+    db: tauri::State<'_, Db>,
+    backup_path: String,
+    allow_untrusted: Option<bool>,
+) -> Result<Value, String> {
     let live = db.path.to_string_lossy().to_string();
-    let prep = with_conn(&db, |conn| {
-        lian_core::backup::prepare_restore(conn, &live, &backup_path)
+    let mut prep = with_conn(&db, |conn| {
+        lian_core::backup::prepare_restore(conn, &live, &backup_path, allow_untrusted.unwrap_or(false))
     })?;
     let mut guard = db.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
-    *guard = None; // close current connection
-    for suffix in ["-wal", "-shm"] {
-        let p = PathBuf::from(format!("{live}{suffix}"));
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
+    *guard = None; // close current connection before touching files
+    match lian_core::backup::perform_restore_swap(&live, &backup_path) {
+        Ok((conn, outcome)) => {
+            *guard = Some(conn);
+            prep["outcome"] = outcome;
+            Ok(prep)
+        }
+        Err(e) => {
+            // Swap failed and rolled back (or reported it could not); try to
+            // reopen whatever database is in place so the app stays usable.
+            if let Ok(conn) = lian_core::db::open(&db.path) {
+                *guard = Some(conn);
+            }
+            Err(e.to_string())
         }
     }
-    std::fs::copy(&backup_path, &db.path).map_err(|e| format!("restore copy failed: {e}"))?;
-    let conn = lian_core::db::open(&db.path).map_err(|e| e.to_string())?;
-    *guard = Some(conn);
-    Ok(prep)
 }
 
 /// Permanently delete all local data, then start from an empty database.
+/// Defense in depth: the confirmation phrase is verified at the command
+/// boundary, not only in frontend state.
 #[tauri::command]
-fn purge_all_data(db: tauri::State<'_, Db>) -> Result<Value, String> {
+fn purge_all_data(db: tauri::State<'_, Db>, confirm: String) -> Result<Value, String> {
+    if confirm != "delete everything" {
+        return Err("confirmation phrase mismatch; data untouched".into());
+    }
     let live = db.path.to_string_lossy().to_string();
     let mut guard = db.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
     *guard = None;

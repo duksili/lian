@@ -9,10 +9,11 @@ export async function dataLocation(): Promise<string> {
   return (await invoke("data_location")) as string;
 }
 
-export async function restoreBackup(backupPath: string): Promise<any> {
-  return await invoke("restore_backup", { backupPath });
+export async function restoreBackup(backupPath: string, allowUntrusted = false): Promise<any> {
+  return await invoke("restore_backup", { backupPath, allowUntrusted });
 }
 
-export async function purgeAllData(): Promise<any> {
-  return await invoke("purge_all_data");
+/** The confirmation phrase is re-verified at the Rust command boundary. */
+export async function purgeAllData(confirm: string): Promise<any> {
+  return await invoke("purge_all_data", { confirm });
 }

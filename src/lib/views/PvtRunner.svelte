@@ -1,12 +1,13 @@
 <script lang="ts">
   import { api } from "../api";
-  import { app, toast, reportError, bump } from "../state.svelte";
+  import { app, reportError, bump } from "../state.svelte";
   import { onMount } from "svelte";
+  import { PvtMachine, type PvtAction } from "../assessment/pvtMachine";
 
   let { onclose }: { onclose: (finished: boolean) => void } = $props();
 
-  type Phase = "prep" | "countdown" | "waiting" | "stimulus" | "feedback" | "done" | "confirm_abort";
-  let phase = $state<Phase>("prep");
+  type UiPhase = "prep" | "countdown" | "waiting" | "stimulus" | "feedback" | "done" | "confirm_abort";
+  let phase = $state<UiPhase>("prep");
 
   // pre-test
   let familiarization = $state(false);
@@ -14,25 +15,28 @@
   let restedFeeling = $state<"" | "rested" | "average" | "tired">("");
 
   let session = $state<any | null>(null);
-  let intervals: number[] = [];
-  let trials: any[] = [];
-  let trialIndex = 0;
+  let machine: PvtMachine | null = null;
   let counterMs = $state(0);
   let feedbackText = $state("");
-  let visibilityLost = 0;
-  let currentTrialVisibilityLost = false;
   let progress = $state(0);
+  let visibilityLost = 0;
   let result = $state<any | null>(null);
-  let sessionStart = 0;
-  let stimulusOnset = 0;
+  let durationMs = 300_000;
+  let spaceDown = false;
 
   let rafId = 0;
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
+  function clearTimers() {
+    if (timeoutId) clearTimeout(timeoutId);
+    timeoutId = null;
+    cancelAnimationFrame(rafId);
+  }
+
   function onVisibility() {
-    if (document.hidden && ["waiting", "stimulus"].includes(phase)) {
+    if (document.hidden && machine) {
       visibilityLost++;
-      currentTrialVisibilityLost = true;
+      machine.markVisibilityLost();
     }
   }
 
@@ -40,8 +44,7 @@
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
-      if (timeoutId) clearTimeout(timeoutId);
-      cancelAnimationFrame(rafId);
+      clearTimers();
     };
   });
 
@@ -49,7 +52,7 @@
     try {
       const started = await api("assessments.start", {
         kind: "pvt_v1",
-        input_method: app.settings.assessment_input_method ?? "keyboard_spacebar",
+        input_method: "keyboard_spacebar",
         device_metadata: {
           platform: navigator.platform,
           user_agent: navigator.userAgent,
@@ -63,145 +66,134 @@
         is_familiarization: familiarization,
       });
       session = started.session;
-      intervals = started.sequence.intervals_ms;
-      trials = [];
-      trialIndex = 0;
+      const seq = started.sequence;
+      durationMs = seq.duration_ms;
+      machine = new PvtMachine({
+        durationMs: seq.duration_ms,
+        timeoutMs: seq.timeout_ms,
+        feedbackMs: seq.feedback_ms,
+        falseStartMs: seq.false_start_ms,
+        intervals: seq.intervals_ms,
+      });
       visibilityLost = 0;
       phase = "countdown";
       let count = 3;
       feedbackText = String(count);
       const tick = () => {
         count--;
-        if (count > 0) { feedbackText = String(count); timeoutId = setTimeout(tick, 1000); }
-        else {
-          sessionStart = performance.now();
-          nextTrial();
+        if (count > 0) {
+          feedbackText = String(count);
+          timeoutId = setTimeout(tick, 1000);
+        } else {
+          exec(machine!.begin(performance.now()));
         }
       };
       timeoutId = setTimeout(tick, 1000);
-    } catch (e) { reportError(e); onclose(false); }
+    } catch (e) {
+      reportError(e);
+      onclose(false);
+    }
   }
 
-  function nowMs(): number { return Math.round(performance.now() - sessionStart); }
-
-  function nextTrial() {
-    if (trialIndex >= intervals.length) { finish(false); return; }
-    currentTrialVisibilityLost = false;
-    phase = "waiting";
-    const isi = intervals[trialIndex];
-    timeoutId = setTimeout(() => {
-      stimulusOnset = performance.now();
-      phase = "stimulus";
-      counterMs = 0;
-      const loop = () => {
-        if (phase !== "stimulus") return;
-        counterMs = Math.round(performance.now() - stimulusOnset);
-        if (counterMs >= 3000) {
-          // timeout — omission
-          trials.push({
-            trial_index: trialIndex,
-            stimulus_kind: "stimulus",
-            planned_interval_ms: isi,
-            onset_ms: Math.round(stimulusOnset - sessionStart),
-            response_ms: null,
-            reaction_time_ms: null,
-            visibility_lost: currentTrialVisibilityLost,
-          });
-          trialIndex++;
-          showFeedback("·  ·  ·");
-          return;
-        }
+  /** Execute a machine action with real timers; the machine owns the protocol. */
+  function exec(action: PvtAction) {
+    if (!machine) return;
+    progress = Math.min(1, machine.elapsed(performance.now()) / durationMs);
+    switch (action.kind) {
+      case "wait":
+        phase = "waiting";
+        timeoutId = setTimeout(() => exec(machine!.stimulusDue(performance.now())), action.ms);
+        break;
+      case "stimulus": {
+        phase = "stimulus";
+        counterMs = 0;
+        const onset = performance.now();
+        timeoutId = setTimeout(() => {
+          cancelAnimationFrame(rafId);
+          exec(machine!.stimulusTimeout(performance.now()));
+        }, action.timeoutMs);
+        const loop = () => {
+          if (phase !== "stimulus") return;
+          counterMs = Math.round(performance.now() - onset);
+          rafId = requestAnimationFrame(loop);
+        };
         rafId = requestAnimationFrame(loop);
-      };
-      rafId = requestAnimationFrame(loop);
-    }, isi);
-  }
-
-  function showFeedback(text: string) {
-    feedbackText = text;
-    phase = "feedback";
-    progress = trialIndex / intervals.length;
-    timeoutId = setTimeout(() => nextTrial(), 550);
-  }
-
-  function respond() {
-    if (phase === "waiting") {
-      // False start: response before stimulus onset.
-      trials.push({
-        trial_index: trialIndex,
-        stimulus_kind: "stimulus",
-        planned_interval_ms: intervals[trialIndex],
-        onset_ms: null,
-        response_ms: nowMs(),
-        reaction_time_ms: null,
-        is_false_start: true,
-        visibility_lost: currentTrialVisibilityLost,
-      });
-      trialIndex++;
-      if (timeoutId) clearTimeout(timeoutId);
-      showFeedback("too soon");
-      return;
-    }
-    if (phase === "stimulus") {
-      const rt = Math.round(performance.now() - stimulusOnset);
-      cancelAnimationFrame(rafId);
-      trials.push({
-        trial_index: trialIndex,
-        stimulus_kind: "stimulus",
-        planned_interval_ms: intervals[trialIndex],
-        onset_ms: Math.round(stimulusOnset - sessionStart),
-        response_ms: nowMs(),
-        reaction_time_ms: rt,
-        visibility_lost: currentTrialVisibilityLost,
-      });
-      trialIndex++;
-      showFeedback(`${rt} ms`);
+        break;
+      }
+      case "feedback":
+        phase = "feedback";
+        feedbackText = action.text;
+        timeoutId = setTimeout(() => exec(machine!.feedbackDone(performance.now())), action.ms);
+        break;
+      case "finished":
+        finish(false, action.elapsedMs);
+        break;
     }
   }
 
-  async function finish(abortedEarly: boolean) {
+  // A key held across a stimulus onset only emits OS auto-repeats, which are
+  // counted as key-hold events by the machine and never recorded as trials.
+  function respond(repeat: boolean) {
+    if (!machine) return;
+    const action = machine.response(performance.now(), { repeat });
+    if (action) {
+      clearTimers();
+      exec(action);
+    }
+  }
+
+  async function finish(abortedEarly: boolean, elapsedMs?: number) {
+    if (!machine) return;
     phase = "done";
-    if (timeoutId) clearTimeout(timeoutId);
-    cancelAnimationFrame(rafId);
+    clearTimers();
     try {
       result = await api("assessments.finalize", {
         session_id: session.id,
-        trials,
+        trials: machine.trials,
         context: {
           visibility_lost_count: visibilityLost,
-          elapsed_ms: nowMs(),
+          elapsed_ms: Math.round(elapsedMs ?? machine.elapsed(performance.now())),
+          key_hold_events: machine.keyHoldEvents,
+          input_method: "keyboard_spacebar",
           aborted: abortedEarly,
         },
       });
       bump();
-    } catch (e) { reportError(e); }
+    } catch (e) {
+      reportError(e);
+    }
   }
 
   async function abandonWithoutData() {
     try {
       await api("assessments.abort", { session_id: session.id, reason: "user cancelled before completion" });
       bump();
-    } catch (e) { reportError(e); }
+    } catch (e) {
+      reportError(e);
+    }
     onclose(false);
   }
 
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       if (["waiting", "stimulus", "feedback"].includes(phase)) {
-        if (timeoutId) clearTimeout(timeoutId);
-        cancelAnimationFrame(rafId);
+        clearTimers();
         phase = "confirm_abort";
       } else if (phase === "prep") onclose(false);
       return;
     }
     if (e.code === "Space") {
       e.preventDefault();
-      respond();
+      respond(e.repeat);
+      spaceDown = true;
     }
+  }
+  function onkeyup(e: KeyboardEvent) {
+    if (e.code === "Space") spaceDown = false;
   }
 </script>
 
-<svelte:window on:keydown={onkeydown} />
+<svelte:window on:keydown={onkeydown} on:keyup={onkeyup} />
 
 <div class="stage">
   {#if phase === "prep"}
@@ -211,7 +203,7 @@
       <ul class="small dim rules">
         <li>Watch the dim ring. When the millisecond counter appears, press <kbd>space</kbd> as fast as you can.</li>
         <li>Pressing before the counter appears counts as a false start — just wait for the next one.</li>
-        <li>Sit as you usually do for this test. Keep this window focused and undisturbed.</li>
+        <li>The test ends by itself at the five-minute mark. Keep this window focused and undisturbed.</li>
         <li>Responses under 100 ms are false starts; 500 ms or slower counts as a lapse. This is normal variation, not a grade.</li>
       </ul>
       <div class="row wrap" style="margin: 16px 0;">
@@ -248,7 +240,7 @@
         Data so far can be kept (marked incomplete/invalid) or the attempt can be discarded entirely.
       </p>
       <div class="row" style="justify-content:flex-end;">
-        <button class="btn" onclick={() => { phase = "waiting"; nextTrial(); }}>Continue test</button>
+        <button class="btn" onclick={() => exec(machine!.resume(performance.now()))}>Continue test</button>
         <button class="btn" onclick={() => finish(true)}>Stop, keep data</button>
         <button class="btn danger" onclick={abandonWithoutData}>Discard attempt</button>
       </div>

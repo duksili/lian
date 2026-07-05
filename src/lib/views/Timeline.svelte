@@ -3,6 +3,7 @@
   import { dataVersion, openQuickLog, reportError, bump, toast } from "../state.svelte";
   import { fmtDate, fmtDuration, fmtTime, todayStr, addDays, PRECEPT_LABELS } from "../format";
   import ContextModal from "./ContextModal.svelte";
+  import Modal from "../components/Modal.svelte";
   import EmptyState from "../components/EmptyState.svelte";
 
   let rangeDays = $state(14);
@@ -162,17 +163,17 @@
 {/if}
 
 {#if confirmDelete}
-  <div class="scrim-mini" role="presentation" onclick={() => (confirmDelete = null)}>
-    <div class="card pad confirm" role="dialog" onclick={(e) => e.stopPropagation()}>
-      <p>Delete this {confirmDelete.template_name} entry?</p>
-      <p class="small faint">Soft delete keeps it recoverable in the database and audit trail; permanent delete removes it entirely.</p>
-      <div class="row" style="justify-content:flex-end; margin-top:14px;">
-        <button class="btn" onclick={() => (confirmDelete = null)}>Keep</button>
-        <button class="btn" onclick={() => deleteEvent(confirmDelete, false)}>Delete</button>
-        <button class="btn danger" onclick={() => deleteEvent(confirmDelete, true)}>Delete permanently</button>
-      </div>
-    </div>
-  </div>
+  <Modal title="Delete this entry?" subtitle={`${confirmDelete.template_name} · ${fmtDate(confirmDelete.local_date)}`}
+    width="440px" onclose={() => (confirmDelete = null)}>
+    <p class="small faint">
+      Soft delete keeps it recoverable in the database and audit trail; permanent delete removes it entirely.
+    </p>
+    {#snippet footer()}
+      <button class="btn" onclick={() => (confirmDelete = null)}>Keep</button>
+      <button class="btn" onclick={() => deleteEvent(confirmDelete, false)}>Delete</button>
+      <button class="btn danger" onclick={() => deleteEvent(confirmDelete, true)}>Delete permanently</button>
+    {/snippet}
+  </Modal>
 {/if}
 
 <style>
@@ -194,6 +195,4 @@
   .note-preview { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .e-glyph { color: var(--cat, var(--paper-faint)); width: 18px; text-align: center; flex: none; }
   .unresolved { border: 1px dashed var(--line); }
-  .scrim-mini { position: fixed; inset: 0; z-index: 150; background: rgba(10,9,8,.6); display: flex; align-items: center; justify-content: center; }
-  .confirm { max-width: 440px; }
 </style>

@@ -145,12 +145,30 @@
       });
       if (typeof file !== "string") return;
       const check = await api("backup.verify", { path: file });
-      const ok = confirm(
-        `Restore from backup?\n\nIntegrity: ${check.integrity}\nSchema version: ${check.schema_version}\nManifest checksum match: ${check.manifest_found_and_matches ? "yes" : "no / missing"}\n\nA safety copy of the current data is made first.`
-      );
-      if (!ok) return;
+      if (!check.ok) {
+        toast("That file fails the SQLite integrity check — restore refused.", "error");
+        return;
+      }
+      if (!check.schema_supported) {
+        toast(`That backup uses schema v${check.schema_version}, newer than this LIAN supports. Update LIAN first.`, "error");
+        return;
+      }
+      let allowUntrusted = false;
+      if (!check.trusted) {
+        // Advanced recovery: the file opens, but its manifest is missing or
+        // does not match. Make the risk explicit before proceeding.
+        allowUntrusted = confirm(
+          `⚠ Advanced recovery\n\nThis file's manifest is ${check.manifest_found_and_matches ? "present" : "missing or mismatched"}, so LIAN cannot confirm it is an unmodified LIAN backup.\n\nRestore it anyway? A safety copy of your current data is made first, and a failed restore rolls back automatically.`
+        );
+        if (!allowUntrusted) return;
+      } else {
+        const ok = confirm(
+          `Restore from verified backup?\n\nIntegrity: ok\nManifest checksum: matches\nSchema version: ${check.schema_version}\n\nA safety copy of the current data is made first; a failed restore rolls back automatically.`
+        );
+        if (!ok) return;
+      }
       busy = true;
-      const res = await restoreBackup(file);
+      const res = await restoreBackup(file, allowUntrusted);
       busy = false;
       await loadGlobals();
       bump();
@@ -162,7 +180,7 @@
     if (purgeText !== "delete everything") return;
     busy = true;
     try {
-      await purgeAllData();
+      await purgeAllData(purgeText);
       confirmPurge = false; purgeText = "";
       await loadGlobals();
       bump();

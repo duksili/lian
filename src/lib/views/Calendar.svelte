@@ -214,8 +214,8 @@
             {#each eventsFor(date) as e (e.id)}
               <button class="dc-event cat-{e.template_color}" onclick={() => openQuickLog({ eventId: e.id })}>
                 <span class="e-glyph">{e.template_glyph}</span>
-                <span class="grow" style="text-align:left;">{e.template_name}</span>
-                <span class="mono small dim">{fmtDuration(e.duration_seconds)}</span>
+                <span class="grow dc-event-name">{e.template_name}</span>
+                <span class="mono small dim" style="flex:none;">{fmtDuration(e.duration_seconds)}</span>
               </button>
             {/each}
           </div>
@@ -279,7 +279,11 @@
     font-size: 12.5px; color: var(--paper);
   }
   .dc-event:hover { background: var(--ink-3); }
-  .e-glyph { color: var(--cat, var(--paper-faint)); }
+  .dc-event-name {
+    text-align: left; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .e-glyph { color: var(--cat, var(--paper-faint)); flex: none; }
   .series-row { padding: 6px 8px; border-radius: var(--r-sm); }
   .series-row:hover { background: var(--ink-3); }
 

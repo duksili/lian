@@ -69,6 +69,7 @@ pub fn start_session(conn: &Connection, input: StartSessionInput) -> Result<Valu
             "kind": "pvt_v1",
             "duration_ms": assessments::PVT_DURATION_MS,
             "timeout_ms": assessments::PVT_TIMEOUT_MS,
+            "feedback_ms": assessments::PVT_FEEDBACK_MS,
             "false_start_ms": assessments::PVT_FALSE_START_MS,
             "lapse_ms": assessments::PVT_LAPSE_MS,
             "intervals_ms": assessments::pvt_schedule(seed),
@@ -109,6 +110,11 @@ pub fn finalize_session(conn: &Connection, input: FinalizeInput) -> Result<Value
     // Deviation-from-window flag for validity context.
     let mut ctx = input.context;
     ctx.configured_input_method = settings::get_string(conn, "assessment_input_method")?;
+    // The input method actually used is session provenance: it was recorded
+    // at session start; the finalize payload may override but never omit it.
+    if ctx.input_method.is_none() {
+        ctx.input_method = session["input_method"].as_str().map(String::from);
+    }
     if !ctx.outside_window {
         ctx.outside_window = !is_inside_window_now(conn, &kind)?;
     }

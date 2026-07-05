@@ -217,15 +217,25 @@ fn pvt_session_full_cycle() {
         "pre_test": { "caffeine": false, "seated": true },
     }));
     let session_id = started["session"]["id"].as_str().unwrap().to_string();
-    let intervals = started["sequence"]["intervals_ms"].as_array().unwrap();
-    assert!(intervals.len() >= 25);
+    let sequence = &started["sequence"];
+    let intervals = sequence["intervals_ms"].as_array().unwrap();
+    let duration_ms = sequence["duration_ms"].as_i64().unwrap();
+    let timeout_ms = sequence["timeout_ms"].as_i64().unwrap();
+    let feedback_ms = sequence["feedback_ms"].as_i64().unwrap();
+    assert!(intervals.len() as i64 >= duration_ms / 2000, "pool must cover the deadline");
     assert_eq!(started["session"]["protocol_version"], "pvt-1.0");
 
-    // Simulate raw trials: mostly normal, one lapse, one false start, one omission.
+    // Simulate a deadline-respecting runner: consume intervals until the next
+    // response window no longer fits before the 5-minute deadline.
     let mut trials = Vec::new();
     let mut clock = 0i64;
-    for (i, isi) in intervals.iter().enumerate() {
-        clock += isi.as_i64().unwrap();
+    let mut i = 0usize;
+    loop {
+        let isi = intervals[i].as_i64().unwrap();
+        if clock + isi + timeout_ms > duration_ms {
+            break; // runner stops scheduling; session completes at `clock`
+        }
+        clock += isi;
         let (rt, resp): (Option<i64>, Option<i64>) = match i {
             2 => (Some(620), Some(clock + 620)), // lapse
             5 => (Some(40), Some(clock + 40)),   // false start
@@ -237,23 +247,27 @@ fn pvt_session_full_cycle() {
             "planned_interval_ms": isi, "onset_ms": clock,
             "response_ms": resp, "reaction_time_ms": rt,
         }));
-        clock += rt.unwrap_or(3000);
+        clock += rt.unwrap_or(timeout_ms) + feedback_ms;
+        i += 1;
     }
+    let trial_total = trials.len();
+    assert!(clock <= duration_ms, "runner simulation must not overrun the deadline");
+    assert!(clock >= duration_ms - 20_000, "runner should fill the duration to within tolerance");
     let done = call(&conn, "assessments.finalize", json!({
         "session_id": session_id,
         "trials": trials,
-        "context": { "elapsed_ms": 300000, "visibility_lost_count": 0 },
+        "context": { "elapsed_ms": clock, "visibility_lost_count": 0 },
     }));
     assert_eq!(done["status"], "completed");
     assert_eq!(done["validity_state"], "valid");
     assert_eq!(done["derived_metrics"]["lapse_count"], 1);
     assert_eq!(done["derived_metrics"]["false_start_count"], 1);
     assert_eq!(done["derived_metrics"]["omission_count"], 1);
-    assert_eq!(done["trial_count"].as_i64().unwrap(), intervals.len() as i64);
+    assert_eq!(done["trial_count"].as_i64().unwrap(), trial_total as i64);
 
     // Raw trials retrievable.
     let full = call(&conn, "assessments.get", json!({ "id": session_id }));
-    assert_eq!(full["trials"].as_array().unwrap().len(), intervals.len());
+    assert_eq!(full["trials"].as_array().unwrap().len(), trial_total);
     assert_eq!(full["trials"][2]["is_lapse"], 1);
     assert_eq!(full["trials"][5]["is_false_start"], 1);
 
@@ -297,6 +311,96 @@ fn gng_session_and_interruption_flags() {
 }
 
 #[test]
+fn input_method_mismatch_is_flagged() {
+    let conn = setup();
+    // Configured method is keyboard_spacebar (default); session used enter.
+    let started = call(&conn, "assessments.start", json!({
+        "kind": "pvt_v1", "input_method": "keyboard_enter",
+    }));
+    let session_id = started["session"]["id"].as_str().unwrap().to_string();
+    let done = call(&conn, "assessments.finalize", json!({
+        "session_id": session_id,
+        "trials": [{ "trial_index": 0, "stimulus_kind": "stimulus", "onset_ms": 2500,
+                     "response_ms": 2800, "reaction_time_ms": 300 }],
+        "context": { "elapsed_ms": 300000 },
+    }));
+    assert_eq!(done["validity_state"], "caution");
+    assert!(done["validity_reasons"].as_array().unwrap()
+        .iter().any(|r| r == "input_method_differs_from_configured"));
+}
+
+#[test]
+fn pvt_overrun_is_a_protocol_deviation() {
+    let conn = setup();
+    let started = call(&conn, "assessments.start", json!({ "kind": "pvt_v1" }));
+    let session_id = started["session"]["id"].as_str().unwrap().to_string();
+    let trials: Vec<serde_json::Value> = (0..30).map(|i| json!({
+        "trial_index": i, "stimulus_kind": "stimulus", "onset_ms": i * 9000,
+        "response_ms": i * 9000 + 300, "reaction_time_ms": 300,
+    })).collect();
+    // 30 s over the 5-minute deadline -> caution with duration_overrun.
+    let done = call(&conn, "assessments.finalize", json!({
+        "session_id": session_id, "trials": trials,
+        "context": { "elapsed_ms": 300000 + 30000 },
+    }));
+    assert_eq!(done["validity_state"], "caution");
+    assert!(done["validity_reasons"].as_array().unwrap()
+        .iter().any(|r| r == "duration_overrun"));
+}
+
+#[test]
+fn reminder_pause_expiry_and_midnight() {
+    use chrono::{Duration, Utc};
+    let conn = setup();
+    call(&conn, "settings.set", json!({
+        "timezone": "UTC",
+        "quiet_hours_start": "03:00", "quiet_hours_end": "03:01",
+    }));
+    // A plan tomorrow at 00:10 UTC with 30 minutes notice: the reminder
+    // occurrence is today 23:40, i.e. before midnight.
+    let today = lian_core::repo_daily::today(&conn).unwrap();
+    let tomorrow = lian_core::util::add_days(&today, 1).unwrap();
+    call(&conn, "plans.save", json!({
+        "title": "Early sit", "kind": "activity",
+        "local_date": tomorrow, "time_of_day": "00:10",
+        "reminder_offset_minutes": 30,
+    }));
+    let fire_at = lian_core::util::parse_instant(
+        &lian_core::util::local_to_instant(&today, "23:40", "UTC").unwrap()
+    ).unwrap().with_timezone(&Utc);
+
+    // 5 minutes into the grace window, still before midnight: fires.
+    let due = lian_core::reminders::due_notifications_at(&conn, fire_at + Duration::minutes(5)).unwrap();
+    assert_eq!(due.len(), 1, "cross-midnight offset reminder should fire before midnight");
+    assert_eq!(due[0]["kind"], "plan");
+
+    // Grace window continuing after midnight (now = 00:05 next day) still
+    // finds the same occurrence and the same dedupe key.
+    let after_midnight = lian_core::reminders::due_notifications_at(&conn, fire_at + Duration::minutes(25)).unwrap();
+    assert_eq!(after_midnight.len(), 1);
+    assert_eq!(after_midnight[0]["dedupe_key"], due[0]["dedupe_key"]);
+
+    // Temporary pause: active until its expiry, then self-clearing.
+    let now = fire_at + Duration::minutes(5);
+    let until = (now + Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    lian_core::reminders::set_pause(&conn, true, Some(until)).unwrap();
+    assert!(lian_core::reminders::due_notifications_at(&conn, now).unwrap().is_empty(),
+        "paused window must suppress");
+    let due_after = lian_core::reminders::due_notifications_at(&conn, now + Duration::hours(2) + Duration::minutes(1)).unwrap();
+    // Pause has expired and cleared itself; the plan occurrence is outside its
+    // grace window by then, so verify via the settings flag instead.
+    let settings = call(&conn, "settings.get", json!({}));
+    assert_eq!(settings["notifications_paused"], false, "expired pause must clear itself");
+    drop(due_after);
+
+    // Indefinite pause stays until manually resumed.
+    lian_core::reminders::set_pause(&conn, true, None).unwrap();
+    assert!(lian_core::reminders::due_notifications_at(&conn, now).unwrap().is_empty());
+    let settings = call(&conn, "settings.get", json!({}));
+    assert_eq!(settings["notifications_paused"], true);
+}
+
+#[test]
 fn association_analysis_transparency() {
     let conn = setup();
     let taiji = first_template_id(&conn, "Taiji");
@@ -330,7 +434,7 @@ fn association_analysis_transparency() {
     }));
     // Transparency requirements.
     assert!(result["included_count"].as_i64().unwrap() > 0);
-    assert!(result["values_json"]["points"].as_array().unwrap().len() > 0);
+    assert!(!result["values_json"]["points"].as_array().unwrap().is_empty());
     assert!(result["caveats"].as_array().unwrap().len() >= 2);
     assert_eq!(result["analysis_version"], "analysis-1.0");
     let label = result["evidence_label"].as_str().unwrap();
@@ -394,6 +498,79 @@ fn protocol_version_discipline() {
         "note": "no consistent difference",
     }));
     assert_eq!(concluded["conclusion"], "protocol_result_not_supported");
+}
+
+#[test]
+fn protocol_linked_analysis_lifecycle() {
+    let conn = setup();
+    let taiji = first_template_id(&conn, "Taiji");
+    let dims = call(&conn, "dimensions.list", json!({}));
+    let calm = dims.as_array().unwrap().iter().find(|d| d["key"] == "calm").unwrap()["id"]
+        .as_str().unwrap().to_string();
+    for day in 1..=28 {
+        let date = format!("2026-06-{day:02}");
+        if day % 2 == 0 {
+            call(&conn, "events.save", json!({
+                "template_id": taiji, "occurred_at": format!("{date}T07:00:00+02:00"),
+                "duration_seconds": 1800,
+            }));
+        }
+        call(&conn, "checkins.save", json!({
+            "local_date": date, "ratings": { calm.clone(): if day % 2 == 0 { 4 } else { 2 } },
+        }));
+    }
+
+    // Protocol with a machine-readable predefined analysis spec.
+    let spec = json!({
+        "exposure": { "kind": "activity_duration", "template_id": taiji, "label": "Taiji minutes" },
+        "outcome": { "kind": "checkin_dimension", "dimension_id": calm, "label": "Calm" },
+        "lag_days": 0,
+        "from": "2026-06-01", "to": "2026-06-28",
+    });
+    let p = call(&conn, "protocols.save", json!({
+        "title": "Taiji and same-day calm",
+        "question": "Is same-day calm higher on Taiji days?",
+        "hypothesis": "Calm is rated higher on days with >=30 min Taiji",
+        "primary_outcome_definition": { "kind": "checkin_dimension", "dimension_id": calm, "version": "analysis-1.0" },
+        "intervention_definition": "Taiji 30 min every other day",
+        "analysis_plan": "Same-day comparison, median split + rank correlation",
+        "analysis_spec": spec,
+    }));
+    let pid = p["id"].as_str().unwrap().to_string();
+    assert!(p["analysis_spec"]["exposure"]["template_id"].as_str().is_some());
+    call(&conn, "protocols.set_status", json!({ "id": pid, "status": "active" }));
+
+    // Run the predefined analysis linked to the protocol.
+    let mut run_spec: Value = p["analysis_spec"].clone();
+    run_spec["protocol_id"] = json!(pid);
+    run_spec["persist"] = json!(true);
+    let result = call(&conn, "analysis.run", run_spec);
+    assert_eq!(result["kind"], "protocol_result");
+    assert_eq!(result["protocol_id"], pid.as_str());
+
+    // The protocol now shows its linked result history.
+    let full = call(&conn, "protocols.get", json!({ "id": pid }));
+    assert_eq!(full["results"].as_array().unwrap().len(), 1);
+
+    // Results viewed -> locked; amending the spec forks version 2 with history.
+    call(&conn, "protocols.lock_results", json!({ "id": pid }));
+    let mut amended_spec = p["analysis_spec"].clone();
+    amended_spec["lag_days"] = json!(1);
+    let amended = call(&conn, "protocols.save", json!({
+        "id": pid,
+        "title": "Taiji and same-day calm",
+        "question": "Is same-day calm higher on Taiji days?",
+        "hypothesis": "Calm is rated higher on days with >=30 min Taiji",
+        "primary_outcome_definition": { "kind": "checkin_dimension", "dimension_id": calm, "version": "analysis-1.0" },
+        "intervention_definition": "Taiji 30 min every other day",
+        "analysis_plan": "Same-day comparison, median split + rank correlation",
+        "analysis_spec": amended_spec,
+    }));
+    assert_eq!(amended["version"], 2);
+    assert_eq!(amended["predecessor_id"], pid.as_str());
+    let old = call(&conn, "protocols.get", json!({ "id": pid }));
+    assert_eq!(old["status"], "superseded");
+    assert_eq!(old["results"].as_array().unwrap().len(), 1, "old version keeps its result history");
 }
 
 #[test]
@@ -467,6 +644,96 @@ fn backup_export_restore_cycle() {
 }
 
 #[test]
+fn restore_trust_gating_and_rollback() {
+    use lian_core::backup;
+    let dir = tempfile::tempdir().unwrap();
+    let live_path = dir.path().join("live.sqlite3");
+    let live = live_path.to_string_lossy().to_string();
+
+    // Real file-backed live DB with one event.
+    let conn = lian_core::db::open(&live_path).unwrap();
+    dispatch(&conn, "settings.set", json!({ "timezone": "UTC" })).unwrap();
+    let med = first_template_id(&conn, "Meditation");
+    call(&conn, "events.save", json!({
+        "template_id": med, "local_date": "2026-07-01", "duration_seconds": 600,
+    }));
+    let backup = call(&conn, "backup.create", json!({ "dest_dir": dir.path().to_string_lossy() }));
+    let backup_path = backup["path"].as_str().unwrap().to_string();
+
+    // Trusted backup verifies as trusted.
+    let v = backup::verify_backup(&backup_path).unwrap();
+    assert_eq!(v["trusted"], true);
+
+    // Tampered backup: integrity still ok but checksum mismatch -> untrusted,
+    // normal restore refused, advanced path allowed.
+    let tampered = dir.path().join("tampered.sqlite3");
+    std::fs::copy(&backup_path, &tampered).unwrap();
+    {
+        let t = rusqlite::Connection::open(&tampered).unwrap();
+        t.execute("UPDATE activity_events SET note='tampered'", []).unwrap();
+    }
+    let manifest_src = std::path::Path::new(&backup_path).with_extension("").with_extension("manifest.json");
+    std::fs::copy(&manifest_src, dir.path().join("tampered.manifest.json")).unwrap();
+    let v2 = backup::verify_backup(tampered.to_string_lossy().as_ref()).unwrap();
+    assert_eq!(v2["ok"], true);
+    assert_eq!(v2["manifest_found_and_matches"], false);
+    assert_eq!(v2["trusted"], false);
+    assert!(backup::prepare_restore(&conn, &live, tampered.to_string_lossy().as_ref(), false).is_err());
+    assert!(backup::prepare_restore(&conn, &live, tampered.to_string_lossy().as_ref(), true).is_ok());
+
+    // Missing manifest -> untrusted, refused without the advanced flag.
+    let orphan = dir.path().join("orphan.sqlite3");
+    std::fs::copy(&backup_path, &orphan).unwrap();
+    assert!(backup::prepare_restore(&conn, &live, orphan.to_string_lossy().as_ref(), false).is_err());
+
+    // Future schema -> always refused, even with the advanced flag.
+    let future = dir.path().join("future.sqlite3");
+    std::fs::copy(&backup_path, &future).unwrap();
+    {
+        let f = rusqlite::Connection::open(&future).unwrap();
+        f.pragma_update(None, "user_version", 99).unwrap();
+    }
+    assert!(backup::prepare_restore(&conn, &live, future.to_string_lossy().as_ref(), true).is_err());
+
+    // Corrupt staged candidate: swap refuses and live data is untouched.
+    drop(conn);
+    let garbage = dir.path().join("garbage.sqlite3");
+    std::fs::write(&garbage, b"this is not a database").unwrap();
+    assert!(backup::perform_restore_swap(&live, garbage.to_string_lossy().as_ref()).is_err());
+    let reopened = lian_core::db::open(&live_path).unwrap();
+    let n: i64 = reopened.query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "live data must survive a failed restore");
+
+    // Restored file that cannot migrate (future schema) -> automatic rollback.
+    drop(reopened);
+    let (conn_after, outcome) = match backup::perform_restore_swap(&live, future.to_string_lossy().as_ref()) {
+        Ok(pair) => pair,
+        Err(e) => panic!("rollback should reopen the previous database: {e}"),
+    };
+    assert_eq!(outcome["rolled_back"], true);
+    let n: i64 = conn_after.query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "previous data must be back after rollback");
+
+    // A genuine, trusted restore round-trips the data.
+    call(&conn_after, "events.save", json!({
+        "template_id": med, "local_date": "2026-07-02", "duration_seconds": 300,
+    }));
+    drop(conn_after);
+    let (restored_conn, outcome) = backup::perform_restore_swap(&live, &backup_path).unwrap();
+    assert_eq!(outcome["restored"], true);
+    let n: i64 = restored_conn.query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "restore returns exactly the backed-up state");
+
+    // Forward guard: a live DB with a newer schema refuses to open.
+    drop(restored_conn);
+    {
+        let f = rusqlite::Connection::open(&live_path).unwrap();
+        f.pragma_update(None, "user_version", 99).unwrap();
+    }
+    assert!(lian_core::db::open(&live_path).is_err());
+}
+
+#[test]
 fn weekly_and_today_views() {
     let conn = setup();
     let med = first_template_id(&conn, "Meditation");
@@ -498,5 +765,5 @@ fn weekly_and_today_views() {
     let monthly = call(&conn, "view.monthly", json!({
         "from": "2026-06-01", "to": today,
     }));
-    assert!(monthly["weeks"].as_array().unwrap().len() >= 1);
+    assert!(!monthly["weeks"].as_array().unwrap().is_empty());
 }

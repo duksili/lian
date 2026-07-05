@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::jsonq::query_json;
-use crate::util::{in_window, new_id, now_local_hhmm, now_rfc3339, parse_hhmm, weekday_index};
+use crate::util::{in_window, new_id, now_rfc3339, parse_hhmm, weekday_index};
 use crate::{settings, Error, Result};
 
 /// Minutes after the scheduled moment during which a reminder may still fire.
@@ -99,125 +99,145 @@ pub fn delete_rule(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn minutes_between(hhmm_a: &str, hhmm_b: &str) -> i64 {
-    let a = match parse_hhmm(hhmm_a) {
-        Ok(t) => t.format("%H:%M").to_string(),
-        Err(_) => return i64::MIN, // malformed rule time never fires
-    };
-    let b = match parse_hhmm(hhmm_b) {
-        Ok(t) => t.format("%H:%M").to_string(),
-        Err(_) => return i64::MIN,
-    };
-    let (ah, am) = (a[..2].parse::<i64>().unwrap_or(0), a[3..5].parse::<i64>().unwrap_or(0));
-    let (bh, bm) = (b[..2].parse::<i64>().unwrap_or(0), b[3..5].parse::<i64>().unwrap_or(0));
-    (bh * 60 + bm) - (ah * 60 + am)
+/// True when `occurrence` is within [now - grace, now]; the grace window is
+/// how long after its moment a reminder may still fire (no catch-up beyond).
+fn in_grace(now: &chrono::DateTime<chrono::Utc>, occurrence_rfc3339: &str) -> bool {
+    match crate::util::parse_instant(occurrence_rfc3339) {
+        Ok(occ) => {
+            let delta = now.signed_duration_since(occ.with_timezone(&chrono::Utc));
+            delta >= chrono::Duration::zero() && delta <= chrono::Duration::minutes(GRACE_MINUTES)
+        }
+        Err(_) => false,
+    }
 }
 
-/// A reminder is "in its firing window" when now is within [t, t + grace].
-fn fires_now(rule_time: &str, now_hhmm: &str) -> bool {
-    let delta = minutes_between(rule_time, now_hhmm);
-    (0..=GRACE_MINUTES).contains(&delta)
+fn instant_lte_now(now: &chrono::DateTime<chrono::Utc>, rfc3339: &str) -> bool {
+    match crate::util::parse_instant(rfc3339) {
+        Ok(t) => t.with_timezone(&chrono::Utc) <= *now,
+        Err(_) => true, // malformed timestamps never keep something suppressed
+    }
 }
 
 /// Compute the notifications that should fire right now. Returns at most one
 /// non-critical notification per call (documented default behavior).
 pub fn due_notifications(conn: &Connection) -> Result<Vec<Value>> {
+    due_notifications_at(conn, chrono::Utc::now())
+}
+
+/// Instant-injected variant so pause expiry, grace windows, and cross-midnight
+/// behavior are all deterministically testable. All comparisons are between
+/// timezone-aware instants; HH:MM strings are only inputs for computing the
+/// local occurrence instant of a rule.
+pub fn due_notifications_at(conn: &Connection, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Value>> {
     let s = settings::get_all(conn)?;
-    // Global pause.
+    // Global pause: a time-bounded pause clears itself once expired; a pause
+    // without an expiry is indefinite until the user resumes.
     if s["notifications_paused"].as_bool().unwrap_or(false) {
-        return Ok(vec![]);
-    }
-    if let Some(until) = s["notifications_pause_until"].as_str() {
-        if now_rfc3339().as_str() < until {
-            return Ok(vec![]);
+        match s["notifications_pause_until"].as_str() {
+            Some(until) if instant_lte_now(&now, until) => {
+                set_pause(conn, false, None)?;
+            }
+            _ => return Ok(vec![]),
         }
     }
     let tz = settings::timezone(conn)?;
-    let now_hhmm = now_local_hhmm(&tz)?;
-    // Quiet hours are mandatory.
+    let tz_parsed = crate::util::parse_tz(&tz)?;
+    let now_local = now.with_timezone(&tz_parsed);
+    let now_hhmm = now_local.format("%H:%M").to_string();
+    // Quiet hours are mandatory (daily local window, may cross midnight).
     let qs = s["quiet_hours_start"].as_str().unwrap_or("21:30");
     let qe = s["quiet_hours_end"].as_str().unwrap_or("07:30");
     if in_window(&now_hhmm, qs, qe)? {
         return Ok(vec![]);
     }
 
-    let today = crate::repo_daily::today(conn)?;
-    let wd = weekday_index(&today)? as i64;
+    let today = now_local.date_naive().format("%Y-%m-%d").to_string();
+    let yesterday = crate::util::add_days(&today, -1)?;
+    let tomorrow = crate::util::add_days(&today, 1)?;
     let minimal = s["lock_screen_minimal"].as_bool().unwrap_or(true);
-    let now = now_rfc3339();
     let mut candidates: Vec<Value> = Vec::new();
 
-    // Rule-based reminders.
+    // Rule-based reminders. A rule occurs at (date, time_of_day) in the local
+    // timezone; we consider yesterday's and today's occurrences so a grace
+    // window that crosses midnight still works.
     for rule in list_rules(conn)? {
         if rule["enabled"].as_i64().unwrap_or(0) == 0 {
             continue;
         }
         if let Some(sn) = rule["snoozed_until"].as_str() {
-            if now.as_str() < sn {
+            if !instant_lte_now(&now, sn) {
                 continue;
             }
-        }
-        let weekdays: Vec<i64> = serde_json::from_value(rule["weekdays"].clone()).unwrap_or_default();
-        if !weekdays.is_empty() && !weekdays.contains(&wd) {
-            continue;
         }
         let kind = rule["kind"].as_str().unwrap_or_default().to_string();
         let time = match rule["time_of_day"].as_str() {
             Some(t) => t.to_string(),
             None => continue,
         };
-        // Monthly review only on the first matching day of the month.
-        if kind == "monthly_review" && !today.ends_with("-01") {
-            continue;
-        }
-        // Determination review prompts only when something is actually due.
-        if kind == "determination_review"
-            && crate::repo_determinations::due_for_review(conn, &today)?.is_empty()
-        {
-            continue;
-        }
-        // Recovery prompt only when yesterday genuinely has no entries yet.
-        if kind == "recovery" {
-            let yesterday = crate::util::add_days(&today, -1)?;
-            let has_any: i64 = conn.query_row(
-                "SELECT (SELECT COUNT(*) FROM activity_events WHERE local_date=?1 AND deleted_at IS NULL)
-                      + (SELECT COUNT(*) FROM daily_checkins WHERE local_date=?1 AND deleted_at IS NULL)",
-                [&yesterday],
-                |r| r.get(0),
-            )?;
-            if has_any > 0 {
+        let weekdays: Vec<i64> = serde_json::from_value(rule["weekdays"].clone()).unwrap_or_default();
+
+        for date in [&yesterday, &today] {
+            // Weekday/monthly filters apply to the occurrence's own date.
+            if !weekdays.is_empty() && !weekdays.contains(&(weekday_index(date)? as i64)) {
                 continue;
             }
+            if kind == "monthly_review" && !date.ends_with("-01") {
+                continue;
+            }
+            let occurrence = match crate::util::local_to_instant(date, &time, &tz) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !in_grace(&now, &occurrence) {
+                continue;
+            }
+            // Determination review prompts only when something is actually due.
+            if kind == "determination_review"
+                && crate::repo_determinations::due_for_review(conn, &today)?.is_empty()
+            {
+                continue;
+            }
+            // Recovery prompt only when yesterday genuinely has no entries yet.
+            if kind == "recovery" {
+                let has_any: i64 = conn.query_row(
+                    "SELECT (SELECT COUNT(*) FROM activity_events WHERE local_date=?1 AND deleted_at IS NULL)
+                          + (SELECT COUNT(*) FROM daily_checkins WHERE local_date=?1 AND deleted_at IS NULL)",
+                    [&yesterday],
+                    |r| r.get(0),
+                )?;
+                if has_any > 0 {
+                    continue;
+                }
+            }
+            let rule_id = rule["id"].as_str().unwrap_or_default().to_string();
+            let dedupe = format!("rule:{rule_id}:{date}");
+            // Neutral, factual text. Privacy: determination titles stay out of
+            // notifications by default; Five Precepts content never appears.
+            let (title, body) = match kind.as_str() {
+                "evening_checkin" => ("Evening check-in".to_string(),
+                    "A quiet moment to record today, if you wish.".to_string()),
+                "weekly_review" => ("Weekly review".to_string(),
+                    "This week's record is ready to look over.".to_string()),
+                "monthly_review" => ("Monthly review".to_string(),
+                    "A month of observations is ready for review.".to_string()),
+                "determination_review" => ("Determination review".to_string(),
+                    if minimal { "A determination is due for private review.".to_string() }
+                    else { rule["label"].as_str().unwrap_or("A determination is due for review.").to_string() }),
+                "recovery" => ("Yesterday".to_string(),
+                    "Yesterday has entries you may still want to add. No action needed.".to_string()),
+                _ => (rule["label"].as_str().unwrap_or("Reminder").to_string(), String::new()),
+            };
+            candidates.push(json!({
+                "dedupe_key": dedupe, "rule_id": rule_id, "plan_id": null,
+                "kind": kind, "title": title, "body": body,
+            }));
         }
-        if !fires_now(&time, &now_hhmm) {
-            continue;
-        }
-        let rule_id = rule["id"].as_str().unwrap_or_default().to_string();
-        let dedupe = format!("rule:{rule_id}:{today}");
-        // Neutral, factual text. Privacy: determination titles stay out of
-        // notifications by default; Five Precepts content never appears.
-        let (title, body) = match kind.as_str() {
-            "evening_checkin" => ("Evening check-in".to_string(),
-                "A quiet moment to record today, if you wish.".to_string()),
-            "weekly_review" => ("Weekly review".to_string(),
-                "This week's record is ready to look over.".to_string()),
-            "monthly_review" => ("Monthly review".to_string(),
-                "A month of observations is ready for review.".to_string()),
-            "determination_review" => ("Determination review".to_string(),
-                if minimal { "A determination is due for private review.".to_string() }
-                else { rule["label"].as_str().unwrap_or("A determination is due for review.").to_string() }),
-            "recovery" => ("Yesterday".to_string(),
-                "Yesterday has entries you may still want to add. No action needed.".to_string()),
-            _ => (rule["label"].as_str().unwrap_or("Reminder").to_string(), String::new()),
-        };
-        candidates.push(json!({
-            "dedupe_key": dedupe, "rule_id": rule_id, "plan_id": null,
-            "kind": kind, "title": title, "body": body,
-        }));
     }
 
     // Plan reminders: fire `reminder_offset_minutes` before scheduled start.
-    let plans = crate::repo_plans::list_plans(conn, &today, &today)?;
+    // The date range covers yesterday..tomorrow so an offset that reaches
+    // back across midnight (e.g. 00:10 plan, 30 min notice) is not missed.
+    let plans = crate::repo_plans::list_plans(conn, &yesterday, &tomorrow)?;
     for p in &plans {
         let offset = match p["reminder_offset_minutes"].as_i64() {
             Some(o) => o,
@@ -231,18 +251,16 @@ pub fn due_notifications(conn: &Connection) -> Result<Vec<Value>> {
         if !["due", "upcoming"].contains(&status) {
             continue;
         }
-        let start_local = crate::util::parse_instant(&start)?
-            .with_timezone(&crate::util::parse_tz(&tz)?)
-            .format("%H:%M")
-            .to_string();
-        let fire_minute = {
-            let (h, m) = (start_local[..2].parse::<i64>().unwrap_or(0), start_local[3..5].parse::<i64>().unwrap_or(0));
-            let total = h * 60 + m - offset;
-            format!("{:02}:{:02}", (total.rem_euclid(1440)) / 60, (total.rem_euclid(1440)) % 60)
+        let start_instant = match crate::util::parse_instant(&start) {
+            Ok(t) => t.with_timezone(&chrono::Utc),
+            Err(_) => continue,
         };
-        if !fires_now(&fire_minute, &now_hhmm) {
+        let fire_at = (start_instant - chrono::Duration::minutes(offset))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        if !in_grace(&now, &fire_at) {
             continue;
         }
+        let start_local = start_instant.with_timezone(&tz_parsed).format("%H:%M").to_string();
         let plan_id = p["id"].as_str().unwrap_or_default().to_string();
         let dedupe = format!("plan:{plan_id}");
         let title = p["title"].as_str().unwrap_or("Planned activity").to_string();
@@ -257,7 +275,11 @@ pub fn due_notifications(conn: &Connection) -> Result<Vec<Value>> {
     for due in crate::repo_assess::due_today(conn)? {
         let kind = due["kind"].as_str().unwrap_or_default().to_string();
         let ws = due["window_start"].as_str().unwrap_or("07:00");
-        if !fires_now(ws, &now_hhmm) {
+        let occurrence = match crate::util::local_to_instant(&today, ws, &tz) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !in_grace(&now, &occurrence) {
             continue;
         }
         let dedupe = format!("assessment:{kind}:{today}");

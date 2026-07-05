@@ -41,6 +41,10 @@ pub struct ProtocolInput {
     pub stop_criteria: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Machine-readable predefined analysis (exposure/outcome/lag/exclusions
+    /// as accepted by `analysis.run`), fixed with the protocol.
+    #[serde(default)]
+    pub analysis_spec: Option<Value>,
 }
 
 pub fn save_protocol(conn: &Connection, input: ProtocolInput) -> Result<Value> {
@@ -55,9 +59,15 @@ pub fn save_protocol(conn: &Connection, input: ProtocolInput) -> Result<Value> {
             let prior = snapshot(conn, "research_protocols", id)?
                 .ok_or_else(|| Error::not_found("protocol"))?;
             let locked = prior["results_locked"].as_i64().unwrap_or(0) == 1;
+            let spec_changed = input
+                .analysis_spec
+                .as_ref()
+                .map(|s| prior["analysis_spec"] != *s)
+                .unwrap_or(false);
             let outcome_changed = prior["primary_outcome_definition"] != input.primary_outcome_definition
                 || prior["analysis_plan"].as_str() != Some(input.analysis_plan.as_str())
-                || prior["hypothesis"].as_str() != Some(input.hypothesis.as_str());
+                || prior["hypothesis"].as_str() != Some(input.hypothesis.as_str())
+                || spec_changed;
             if locked && outcome_changed {
                 // Amendment after results were viewed -> new version, old superseded.
                 return amend_protocol(conn, id, input);
@@ -66,13 +76,14 @@ pub fn save_protocol(conn: &Connection, input: ProtocolInput) -> Result<Value> {
                 "UPDATE research_protocols SET title=?2, question=?3, hypothesis=?4, start_date=?5, end_date=?6,
                    primary_outcome_definition=?7, intervention_definition=?8, analysis_plan=?9,
                    secondary_outcomes=?10, adherence_requirements=?11, context_variables=?12,
-                   stop_criteria=?13, notes=?14, updated_at=?15
+                   stop_criteria=?13, notes=?14, analysis_spec=?15, updated_at=?16
                  WHERE id=?1",
                 params![
                     id, input.title.trim(), input.question, input.hypothesis, input.start_date, input.end_date,
                     input.primary_outcome_definition.to_string(), input.intervention_definition,
                     input.analysis_plan, input.secondary_outcomes, input.adherence_requirements,
-                    input.context_variables, input.stop_criteria, input.notes, now
+                    input.context_variables, input.stop_criteria, input.notes,
+                    input.analysis_spec.as_ref().map(|s| s.to_string()), now
                 ],
             )?;
             audit(conn, "research_protocol", id, "update", Some(&prior), None)?;
@@ -85,13 +96,14 @@ pub fn save_protocol(conn: &Connection, input: ProtocolInput) -> Result<Value> {
                    (id, title, version, question, hypothesis, status, start_date, end_date,
                     primary_outcome_definition, intervention_definition, analysis_plan,
                     secondary_outcomes, adherence_requirements, context_variables, stop_criteria,
-                    notes, created_at, updated_at)
-                 VALUES (?1,?2,1,?3,?4,'draft',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+                    notes, analysis_spec, created_at, updated_at)
+                 VALUES (?1,?2,1,?3,?4,'draft',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16)",
                 params![
                     id, input.title.trim(), input.question, input.hypothesis, input.start_date, input.end_date,
                     input.primary_outcome_definition.to_string(), input.intervention_definition,
                     input.analysis_plan, input.secondary_outcomes, input.adherence_requirements,
-                    input.context_variables, input.stop_criteria, input.notes, now
+                    input.context_variables, input.stop_criteria, input.notes,
+                    input.analysis_spec.as_ref().map(|s| s.to_string()), now
                 ],
             )?;
             id
@@ -110,14 +122,14 @@ fn amend_protocol(conn: &Connection, old_id: &str, input: ProtocolInput) -> Resu
            (id, title, version, question, hypothesis, status, start_date, end_date,
             primary_outcome_definition, intervention_definition, analysis_plan,
             secondary_outcomes, adherence_requirements, context_variables, stop_criteria,
-            notes, predecessor_id, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,'draft',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)",
+            notes, analysis_spec, predecessor_id, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,'draft',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)",
         params![
             id, input.title.trim(), old_version + 1, input.question, input.hypothesis,
             input.start_date, input.end_date, input.primary_outcome_definition.to_string(),
             input.intervention_definition, input.analysis_plan, input.secondary_outcomes,
             input.adherence_requirements, input.context_variables, input.stop_criteria,
-            input.notes, old_id, now
+            input.notes, input.analysis_spec.as_ref().map(|s| s.to_string()), old_id, now
         ],
     )?;
     conn.execute(

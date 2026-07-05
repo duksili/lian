@@ -82,7 +82,10 @@ pub fn list_backups(conn: &Connection) -> Result<Vec<Value>> {
     Ok(rows)
 }
 
-/// Verify a backup file: integrity check + checksum against its manifest.
+/// Verify a backup file. `ok` reports SQLite integrity alone; `trusted`
+/// additionally requires a matching manifest checksum and a schema version
+/// this binary supports. Normal restore requires `trusted`; anything less is
+/// an explicit advanced-recovery decision.
 pub fn verify_backup(backup_path: &str) -> Result<Value> {
     let path = Path::new(backup_path);
     if !path.exists() {
@@ -99,25 +102,51 @@ pub fn verify_backup(backup_path: &str) -> Result<Value> {
         Ok(m) => serde_json::from_str::<Value>(&m)
             .map(|m| m["checksum_sha256"].as_str() == Some(checksum.as_str()))
             .unwrap_or(false),
-        Err(_) => false, // manifest optional for restore, reported honestly
+        Err(_) => false,
     };
+    let integrity_ok = integrity == "ok";
+    let schema_supported = schema_version <= db::SCHEMA_VERSION;
     Ok(json!({
-        "ok": integrity == "ok",
+        "ok": integrity_ok,
         "integrity": integrity,
         "schema_version": schema_version,
         "current_schema_version": db::SCHEMA_VERSION,
+        "schema_supported": schema_supported,
         "checksum_sha256": checksum,
         "manifest_found_and_matches": manifest_matches,
+        "trusted": integrity_ok && schema_supported && manifest_matches,
     }))
 }
 
 /// Restore is performed by the shell (it must close/reopen the connection):
 /// this prepares by verifying the backup and writing a safety copy of the
 /// live database next to it. Returns what the shell needs to finish.
-pub fn prepare_restore(conn: &Connection, live_db_path: &str, backup_path: &str) -> Result<Value> {
+///
+/// A normal restore requires a trusted backup (integrity, matching manifest
+/// checksum, and a supported schema). `allow_untrusted` is the
+/// advanced-recovery escape hatch for a manifest-less file — it still refuses
+/// integrity failures and future schemas.
+pub fn prepare_restore(
+    conn: &Connection,
+    live_db_path: &str,
+    backup_path: &str,
+    allow_untrusted: bool,
+) -> Result<Value> {
     let verification = verify_backup(backup_path)?;
     if verification["ok"].as_bool() != Some(true) {
         return Err(Error::invalid("backup failed integrity check; restore refused"));
+    }
+    if verification["schema_supported"].as_bool() != Some(true) {
+        return Err(Error::invalid(format!(
+            "backup uses schema v{} which is newer than this LIAN supports (v{}); update LIAN first",
+            verification["schema_version"], db::SCHEMA_VERSION
+        )));
+    }
+    if verification["trusted"].as_bool() != Some(true) && !allow_untrusted {
+        return Err(Error::invalid(
+            "backup manifest is missing or its checksum does not match; \
+             restore refused (use advanced recovery to proceed anyway)",
+        ));
     }
     let safety_dir = Path::new(live_db_path).parent().unwrap_or(Path::new(".")).join("safety-copies");
     fs::create_dir_all(&safety_dir)?;
@@ -129,6 +158,81 @@ pub fn prepare_restore(conn: &Connection, live_db_path: &str, backup_path: &str)
         "live_db_path": live_db_path,
         "backup_path": backup_path,
     }))
+}
+
+/// Swap the live database for a verified backup, rollback-safe.
+///
+/// The caller must have closed every connection to the live database first.
+/// Sequence: stage a copy of the backup next to the live DB → integrity-check
+/// the staged copy → move the live DB aside → move the staged copy into place
+/// → open + migrate. Any failure rolls the previous database back into place.
+/// Returns the opened connection and an outcome report.
+pub fn perform_restore_swap(live_db_path: &str, backup_path: &str) -> Result<(Connection, Value)> {
+    let live = Path::new(live_db_path);
+    let dir = live.parent().unwrap_or(Path::new("."));
+    let staged = dir.join(".lian-restore-staged.sqlite3");
+    let displaced = dir.join(".lian-restore-previous.sqlite3");
+
+    // Stage and verify the candidate before touching the live database.
+    fs::copy(backup_path, &staged).map_err(|e| Error::invalid(format!("could not stage backup: {e}")))?;
+    let integrity: String = {
+        let test = Connection::open(&staged)?;
+        test.query_row("PRAGMA integrity_check", [], |r| r.get(0))?
+    };
+    if integrity != "ok" {
+        let _ = fs::remove_file(&staged);
+        return Err(Error::invalid("staged backup failed integrity check; live data untouched"));
+    }
+
+    // Displace the live DB (keep it until the new one provably opens).
+    for suffix in ["-wal", "-shm"] {
+        let p = PathBuf::from(format!("{live_db_path}{suffix}"));
+        if p.exists() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    let had_live = live.exists();
+    if had_live {
+        fs::rename(live, &displaced).map_err(|e| {
+            let _ = fs::remove_file(&staged);
+            Error::invalid(format!("could not move current database aside: {e}"))
+        })?;
+    }
+    if let Err(e) = fs::rename(&staged, live) {
+        // Roll back: put the previous database back.
+        if had_live {
+            let _ = fs::rename(&displaced, live);
+        }
+        let _ = fs::remove_file(&staged);
+        return Err(Error::invalid(format!(
+            "could not move restored database into place: {e}; previous data was kept in place"
+        )));
+    }
+
+    match db::open(live) {
+        Ok(conn) => {
+            if had_live {
+                let _ = fs::remove_file(&displaced);
+            }
+            Ok((conn, json!({ "restored": true, "rolled_back": false })))
+        }
+        Err(open_err) => {
+            // The restored file does not open/migrate: roll back.
+            let _ = fs::remove_file(live);
+            let rolled_back = if had_live { fs::rename(&displaced, live).is_ok() } else { false };
+            match db::open(live) {
+                Ok(conn) if rolled_back => Ok((conn, json!({
+                    "restored": false,
+                    "rolled_back": true,
+                    "error": format!("restored database failed to open ({open_err}); previous data was rolled back"),
+                }))),
+                _ => Err(Error::invalid(format!(
+                    "restore failed ({open_err}) and rollback could not reopen the previous database; \
+                     a pre-restore safety copy exists in the safety-copies directory"
+                ))),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- export

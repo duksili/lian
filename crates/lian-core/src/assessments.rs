@@ -23,6 +23,15 @@ pub const PVT_ISI_MAX_MS: i64 = 10000;
 pub const PVT_FALSE_START_MS: i64 = 100;
 pub const PVT_LAPSE_MS: i64 = 500;
 pub const PVT_TIMEOUT_MS: i64 = 3000; // no-response window per stimulus
+pub const PVT_FEEDBACK_MS: i64 = 550; // post-response feedback display
+/// The runner stops scheduling stimuli when the next response window cannot
+/// fit before the 5-minute deadline, so a completed session may legitimately
+/// end up to ISI-max + timeout + feedback (~14 s) short of the deadline.
+pub const PVT_END_TOLERANCE_MS: i64 = 20_000;
+/// Wall-clock overrun beyond the deadline is a protocol deviation: small
+/// overruns are cautionary, material overruns invalidate the session.
+pub const PVT_OVERRUN_CAUTION_MS: i64 = 15_000;
+pub const PVT_OVERRUN_INVALID_MS: i64 = 60_000;
 
 // Go/No-Go v1 fixed parameters (see references/GO_NO_GO_PROTOCOL_V1.md).
 pub const GNG_TRIALS: usize = 160;
@@ -31,23 +40,19 @@ pub const GNG_STIMULUS_MS: i64 = 600; // stimulus visible / response window
 pub const GNG_ISI_MIN_MS: i64 = 900;
 pub const GNG_ISI_MAX_MS: i64 = 1500;
 
-/// Generate the PVT interstimulus schedule for a session seed.
-/// Returns planned intervals (ms) that fit inside the fixed duration.
+/// Generate the PVT interstimulus-interval pool for a session seed.
+///
+/// This is a reproducible *pool*, not a nominal timeline: the runner consumes
+/// intervals in order against a monotonic wall-clock deadline and stops as
+/// soon as the next stimulus's response window would no longer fit before
+/// `PVT_DURATION_MS`. The pool is sized for the worst case (every ISI at the
+/// minimum, instant responses) so it can never run out first.
 pub fn pvt_schedule(seed: u64) -> Vec<i64> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut intervals = Vec::new();
-    let mut elapsed: i64 = 0;
-    loop {
-        let isi = rng.gen_range(PVT_ISI_MIN_MS..=PVT_ISI_MAX_MS);
-        // A stimulus must have room for its response window inside the test.
-        if elapsed + isi + PVT_TIMEOUT_MS > PVT_DURATION_MS {
-            break;
-        }
-        elapsed += isi;
-        intervals.push(isi);
-        elapsed += 0; // response time consumes real time in practice; schedule is nominal
-    }
-    intervals
+    let pool_size = (PVT_DURATION_MS / PVT_ISI_MIN_MS) as usize + 5;
+    (0..pool_size)
+        .map(|_| rng.gen_range(PVT_ISI_MIN_MS..=PVT_ISI_MAX_MS))
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -257,6 +262,10 @@ pub struct SessionContext {
     pub outside_window: bool,
     #[serde(default)]
     pub aborted: bool,
+    /// Times the response key was already held down at stimulus onset, or an
+    /// OS key-repeat had to be discarded (Go/No-Go held-key detection).
+    #[serde(default)]
+    pub key_hold_events: i64,
 }
 
 /// Evaluate validity per the documented warning rules. Returns
@@ -285,6 +294,10 @@ pub fn evaluate_validity(kind: &str, trials: &[RawTrial], ctx: &SessionContext) 
         reasons.push("taken_outside_configured_window".into());
     }
 
+    if ctx.key_hold_events > 0 {
+        reasons.push("accidental_key_hold_detected".into());
+    }
+
     match kind {
         PVT_KIND => {
             let false_starts = trials.iter().filter(|t| classify_pvt_trial(t).is_false_start).count();
@@ -292,9 +305,14 @@ pub fn evaluate_validity(kind: &str, trials: &[RawTrial], ctx: &SessionContext) 
                 reasons.push("excessive_false_starts".into()); // >= 20% of trials
             }
             if let Some(elapsed) = ctx.elapsed_ms {
-                if elapsed < PVT_DURATION_MS - 5_000 {
+                if elapsed < PVT_DURATION_MS - PVT_END_TOLERANCE_MS {
                     reasons.push("incomplete_duration".into());
                     invalid = true;
+                } else if elapsed > PVT_DURATION_MS + PVT_OVERRUN_INVALID_MS {
+                    reasons.push("duration_overrun".into());
+                    invalid = true;
+                } else if elapsed > PVT_DURATION_MS + PVT_OVERRUN_CAUTION_MS {
+                    reasons.push("duration_overrun".into());
                 }
             }
         }
@@ -324,14 +342,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pvt_schedule_is_reproducible_and_bounded() {
+    fn pvt_schedule_is_reproducible_and_sufficient() {
         let a = pvt_schedule(42);
         let b = pvt_schedule(42);
         assert_eq!(a, b);
         assert!(a.iter().all(|i| (PVT_ISI_MIN_MS..=PVT_ISI_MAX_MS).contains(i)));
-        let total: i64 = a.iter().sum();
-        assert!(total + PVT_TIMEOUT_MS <= PVT_DURATION_MS);
-        assert!(a.len() >= 25, "5 min at 2-10s ISI should give >= 25 stimuli, got {}", a.len());
+        // Pool must cover the worst case: all-minimum ISIs with instant responses.
+        assert!(
+            a.len() as i64 >= PVT_DURATION_MS / PVT_ISI_MIN_MS,
+            "pool of {} intervals cannot cover the 5-minute deadline",
+            a.len()
+        );
+        // A deadline-respecting consumer never exceeds the duration: simulate
+        // instant responses and check the fit rule stops in time.
+        let mut clock: i64 = 0;
+        for isi in &a {
+            if clock + isi + PVT_TIMEOUT_MS > PVT_DURATION_MS {
+                break;
+            }
+            clock += isi + 250 + PVT_FEEDBACK_MS; // stimulus + response + feedback
+        }
+        assert!(clock <= PVT_DURATION_MS);
     }
 
     #[test]
@@ -428,6 +459,37 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(state, "invalid");
+
+        // Ending within the deadline fit-tolerance stays valid (the runner
+        // stops when the next response window would not fit).
+        let (state, _) = evaluate_validity(PVT_KIND, &trials, &SessionContext {
+            elapsed_ms: Some(PVT_DURATION_MS - PVT_END_TOLERANCE_MS + 1),
+            ..Default::default()
+        });
+        assert_eq!(state, "valid");
+
+        // Small overrun -> caution; material overrun -> invalid.
+        let (state, reasons) = evaluate_validity(PVT_KIND, &trials, &SessionContext {
+            elapsed_ms: Some(PVT_DURATION_MS + PVT_OVERRUN_CAUTION_MS + 1),
+            ..Default::default()
+        });
+        assert_eq!(state, "caution");
+        assert!(reasons.contains(&"duration_overrun".to_string()));
+        let (state, _) = evaluate_validity(PVT_KIND, &trials, &SessionContext {
+            elapsed_ms: Some(PVT_DURATION_MS + PVT_OVERRUN_INVALID_MS + 1),
+            ..Default::default()
+        });
+        assert_eq!(state, "invalid");
+
+        // Held-key / key-repeat events surface as a caution reason.
+        let (state, reasons) = evaluate_validity(GNG_KIND, &(0..160).map(|i| RawTrial {
+            trial_index: i, stimulus_kind: Some("go".into()), ..Default::default()
+        }).collect::<Vec<_>>(), &SessionContext {
+            key_hold_events: 3,
+            ..Default::default()
+        });
+        assert_eq!(state, "caution");
+        assert!(reasons.contains(&"accidental_key_hold_detected".to_string()));
 
         // GNG with under half the trials -> invalid.
         let few: Vec<RawTrial> = (0..40).map(|i| RawTrial {
