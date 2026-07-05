@@ -1,0 +1,230 @@
+/* ============================================================
+   LIAN design system — "ink & paper"
+   A warm dark studio surface: deep ink ground, paper-cream text,
+   restrained cinnabar accent, muted mineral palette for activity
+   categories. Serif display (Newsreader) for reflective headings,
+   Inter for UI, Plex Mono for data.
+   ============================================================ */
+
+:root {
+  /* ground */
+  --ink-0: #100f0d;      /* deepest — app background */
+  --ink-1: #171613;      /* base surface */
+  --ink-2: #1e1c19;      /* raised card */
+  --ink-3: #262420;      /* hover / inset */
+  --ink-4: #312e29;      /* active / borders strong */
+  --line: #2b2924;       /* hairline */
+  --line-soft: #232019;
+
+  /* text */
+  --paper: #ece7db;      /* primary text */
+  --paper-dim: #b3ac9c;  /* secondary */
+  --paper-faint: #7d776a;/* tertiary / hints */
+  --paper-ghost: #55503f;
+
+  /* accent */
+  --cinnabar: #c96f45;
+  --cinnabar-bright: #e08a5e;
+  --cinnabar-dim: #8a4f34;
+  --cinnabar-wash: rgba(201, 111, 69, 0.12);
+
+  /* semantic */
+  --ok: #8aa87a;
+  --ok-wash: rgba(138, 168, 122, 0.13);
+  --caution: #c9a250;
+  --caution-wash: rgba(201, 162, 80, 0.13);
+  --invalid: #b06055;
+  --invalid-wash: rgba(176, 96, 85, 0.14);
+  --unknown: #6f6a5e;
+  --unknown-wash: rgba(111, 106, 94, 0.16);
+  --info-wash: rgba(122, 143, 166, 0.13);
+
+  /* category palette (activity templates) */
+  --cat-indigo: #7a86b8;
+  --cat-teal: #6fa39c;
+  --cat-moss: #8aa87a;
+  --cat-ochre: #c2a05c;
+  --cat-rust: #bb7757;
+  --cat-slate: #8b93a0;
+  --cat-plum: #a37e9c;
+
+  /* type */
+  --font-ui: "Inter Variable", "Inter", system-ui, sans-serif;
+  --font-display: "Newsreader Variable", "Newsreader", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  /* rhythm */
+  --r-xs: 4px; --r-sm: 7px; --r-md: 10px; --r-lg: 14px;
+  --shadow-1: 0 1px 2px rgba(0,0,0,.25), 0 2px 8px rgba(0,0,0,.18);
+  --shadow-2: 0 2px 6px rgba(0,0,0,.3), 0 10px 32px rgba(0,0,0,.35);
+
+  font-family: var(--font-ui);
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app {
+  height: 100%;
+  background: var(--ink-0);
+  color: var(--paper);
+  font-size: 15px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+::selection { background: var(--cinnabar-dim); color: var(--paper); }
+
+/* ---------- scrollbars ---------- */
+* { scrollbar-width: thin; scrollbar-color: var(--ink-4) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--ink-4); border-radius: 6px; border: 2px solid var(--ink-0); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- typography ---------- */
+h1, h2, h3 { font-weight: 500; letter-spacing: -0.01em; }
+.display {
+  font-family: var(--font-display);
+  font-weight: 460;
+  letter-spacing: 0.005em;
+  font-variation-settings: "opsz" 22;
+}
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.dim { color: var(--paper-dim); }
+.faint { color: var(--paper-faint); }
+.small { font-size: 12.5px; }
+.overline {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--paper-faint);
+}
+
+/* ---------- focus ---------- */
+:focus-visible {
+  outline: 2px solid var(--cinnabar);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* ---------- buttons ---------- */
+button {
+  font: inherit; color: inherit; background: none; border: none; cursor: pointer;
+}
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 7px 14px; border-radius: var(--r-sm);
+  font-size: 13.5px; font-weight: 550; letter-spacing: 0.01em;
+  background: var(--ink-3); color: var(--paper);
+  border: 1px solid var(--line);
+  transition: background 120ms ease, border-color 120ms ease, transform 60ms ease;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--ink-4); border-color: var(--ink-4); }
+.btn:active { transform: translateY(0.5px); }
+.btn:disabled { opacity: 0.45; cursor: default; transform: none; }
+.btn.primary {
+  background: var(--cinnabar); border-color: var(--cinnabar); color: #1a120c;
+  font-weight: 620;
+}
+.btn.primary:hover { background: var(--cinnabar-bright); border-color: var(--cinnabar-bright); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--paper-dim); }
+.btn.ghost:hover { background: var(--ink-3); color: var(--paper); }
+.btn.danger { color: var(--invalid); border-color: var(--invalid); background: transparent; }
+.btn.danger:hover { background: var(--invalid-wash); }
+.btn.sm { padding: 4px 10px; font-size: 12.5px; border-radius: var(--r-xs); }
+
+/* ---------- inputs ---------- */
+input, select, textarea {
+  font: inherit; color: var(--paper);
+  background: var(--ink-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 7px 10px;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+input:hover, select:hover, textarea:hover { border-color: var(--ink-4); }
+input:focus, select:focus, textarea:focus {
+  outline: none; border-color: var(--cinnabar-dim); background: var(--ink-2);
+}
+input::placeholder, textarea::placeholder { color: var(--paper-ghost); }
+textarea { resize: vertical; min-height: 64px; line-height: 1.5; }
+select { appearance: none; padding-right: 26px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237d776a' fill='none' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 9px center;
+}
+input[type="date"], input[type="time"] { font-family: var(--font-mono); font-size: 13px; }
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator { filter: invert(0.7) sepia(0.2); opacity: 0.6; }
+
+label.field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--paper-dim); }
+label.field > span:first-child { font-weight: 550; letter-spacing: 0.02em; }
+
+/* ---------- surfaces ---------- */
+.card {
+  background: var(--ink-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+}
+.card.pad { padding: 18px 20px; }
+.inset {
+  background: var(--ink-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+}
+
+/* ---------- pills / chips ---------- */
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; font-weight: 560; letter-spacing: 0.03em;
+  padding: 2px 9px; border-radius: 99px;
+  background: var(--unknown-wash); color: var(--paper-dim);
+  white-space: nowrap;
+}
+.pill.ok { background: var(--ok-wash); color: var(--ok); }
+.pill.caution { background: var(--caution-wash); color: var(--caution); }
+.pill.invalid { background: var(--invalid-wash); color: var(--invalid); }
+.pill.accent { background: var(--cinnabar-wash); color: var(--cinnabar-bright); }
+.pill.info { background: var(--info-wash); color: #9db1c5; }
+
+.dot { width: 7px; height: 7px; border-radius: 99px; flex: none; }
+
+/* ---------- category colors ---------- */
+.cat-indigo { --cat: var(--cat-indigo); }
+.cat-teal   { --cat: var(--cat-teal); }
+.cat-moss   { --cat: var(--cat-moss); }
+.cat-ochre  { --cat: var(--cat-ochre); }
+.cat-rust   { --cat: var(--cat-rust); }
+.cat-slate  { --cat: var(--cat-slate); }
+.cat-plum   { --cat: var(--cat-plum); }
+
+/* ---------- layout utilities ---------- */
+.row { display: flex; align-items: center; gap: 10px; }
+.row.between { justify-content: space-between; }
+.row.wrap { flex-wrap: wrap; }
+.col { display: flex; flex-direction: column; gap: 10px; }
+.grow { flex: 1; min-width: 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+/* ---------- transitions ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+
+/* ---------- keyboard hint ---------- */
+kbd {
+  font-family: var(--font-mono); font-size: 10.5px;
+  padding: 1.5px 5px; border-radius: 4px;
+  background: var(--ink-3); border: 1px solid var(--line);
+  border-bottom-width: 2px; color: var(--paper-dim);
+}
+
+/* ---------- assessment fullscreen stage ---------- */
+.stage {
+  position: fixed; inset: 0; z-index: 200;
+  background: var(--ink-0);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+}
